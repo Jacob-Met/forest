@@ -856,7 +856,7 @@ finish requires {"tool":"finish","arguments":{"summary":"observed outcome","arti
         persist_reconciliation(state, workspace, 'External supervisor binding changed')
         raise AgentYield(status='waiting_input', reason='External supervisor binding changed; reconcile the original ledger before resuming')
     try:
-        load_accounting(state, workspace)
+        load_accounting(state, workspace, config)
     except ReconciliationRequired as exc:
         persist_reconciliation(state, workspace, str(exc))
         with Session.begin() as s:

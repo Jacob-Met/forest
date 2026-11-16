@@ -174,11 +174,13 @@ def agent_session(ident:str,summary:bool=False):
                 except (OSError,ValueError,UnicodeError) as exc:
                     usage_error={'code':'LEDGER_UNREADABLE','message':'Resource ledger cannot be read; reconcile the original supervisor. '+str(exc)}
                 else:
-                    if (isinstance(ledger,dict) and ledger.get('run_id')==ident
-                            and isinstance(ledger.get('totals'),dict)):
-                        usage={key:ledger.get(key) for key in ('totals','active_seconds','cost_complete','usage_complete','updated_at')}
+                    from research.agents.lifecycle import validate_accounting_ledger, ReconciliationRequired
+                    try:
+                        validate_accounting_ledger(ledger, ident, transcript_steps=len(data.get('transcript', [])))
+                    except ReconciliationRequired:
+                        usage_error={'code':'LEDGER_INVALID','message':'Resource ledger has invalid accounting; reconcile the original supervisor.'}
                     else:
-                        usage_error={'code':'LEDGER_INVALID','message':'Resource ledger does not bind this run or has invalid totals; reconcile the original supervisor.'}
+                        usage={key:ledger.get(key) for key in ('totals','active_seconds','cost_complete','usage_complete','updated_at')}
             data={**{k:data.get(k) for k in ('status','wait_for','updated_at','budget_reason','lifecycle','round','recovery','goal_contract','reconciliation_reason')},
                   'usage':usage,'usage_error':usage_error,'transcript_count':len(data.get('transcript',[]))}
         return {'run_id':ident,'status':run.status,'session':data}
