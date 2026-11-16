@@ -800,6 +800,78 @@ def case_rename_and_delete_wait_for_failed_publication_recovery(client):
     assert not list(root.rglob('.forest-upload-*'))
 
 
+def case_agent_chunk_cannot_overwrite_owner_save(client):
+    """The owner publication must wait for an Agent replay's torn-tail repair."""
+    import time
+    from research.agents import code_writes
+    from research.agents.runtime import ToolRuntime
+    from services.api import files as file_api
+
+    project, root, _ = project_files(client)
+    path = 'shared.txt'
+    (root / path).write_text('oldta')  # Partial 'tail' after a durable prefix.
+    endpoint = f"/api/projects/{project['id']}/file"
+    assert ok(client.get(endpoint, params={'path': path}))['revision'] == 0
+    tool = ToolRuntime('not-needed-for-dispatch', root, ['write_file', 'write_file_chunk'])
+    entered = threading.Event()
+    release = threading.Event()
+    owner_entered_guard = threading.Event()
+    owner_request_started = threading.Event()
+    real_truncate = code_writes.os.truncate
+    real_guard = file_api.file_publication_lock
+
+    def paused_truncate(target, size):
+        if Path(target) == root / path and size == 3:
+            entered.set()
+            assert release.wait(10), 'Owner race was not released'
+        return real_truncate(target, size)
+
+    @contextmanager
+    def observed_guard(project_id, relative):
+        if owner_request_started.is_set() and relative == path:
+            owner_entered_guard.set()
+        with real_guard(project_id, relative):
+            yield
+
+    def save_owner():
+        owner_request_started.set()
+        return client.put(endpoint, json={
+            'path': path, 'content': 'USER UPDATE', 'expected_revision': 0,
+        })
+
+    code_writes.os.truncate = paused_truncate
+    file_api.file_publication_lock = observed_guard
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            chunk = pool.submit(tool.dispatch, 'write_file_chunk',
+                                {'path': path, 'content': 'tail', 'offset': 3},
+                                project['id'], 'replay-action', replay=True)
+            assert entered.wait(5), 'Replay did not reach the repair boundary'
+            owner = pool.submit(save_owner)
+            assert owner_entered_guard.wait(5), 'Owner did not reach publication'
+            time.sleep(.1)
+            assert not owner.done(), 'Owner published while Agent still held the file'
+            release.set()
+            assert chunk.result(timeout=10)['exit_code'] == 0
+            saved = ok(owner.result(timeout=10))
+        assert saved['revision'] == 1
+        current = ok(client.get(endpoint, params={'path': path}))
+        assert current == {
+            'path': path, 'content': 'USER UPDATE', 'revision': 1,
+            'origin': 'user_edited',
+        }
+        with pytest.raises(ValueError, match='Owner-managed'):
+            tool.dispatch('write_file_chunk', {'path': path, 'content': '!', 'offset': 11},
+                          project['id'])
+        with pytest.raises(ValueError, match='Owner-managed'):
+            tool.dispatch('write_file', {'path': path, 'content': 'BAD'}, project['id'])
+        assert ok(client.get(endpoint, params={'path': path})) == current
+    finally:
+        release.set()
+        code_writes.os.truncate = real_truncate
+        file_api.file_publication_lock = real_guard
+
+
 CASES = [name.removeprefix("case_") for name in list(globals()) if name.startswith("case_")]
 
 
