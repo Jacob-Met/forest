@@ -86,7 +86,7 @@ if __name__ == '__main__':
         assert invalid.json()['session']['usage_error']['code']=='LEDGER_INVALID'
         legacy_usage.unlink()
         usage_path.write_bytes(original_usage)
-        for broken in (b'{truncated',b'\xff',b'[]',json.dumps({'run_id':rid,'totals':None}).encode()):
+        for broken in (b'{truncated',b'\xff',b'[]',json.dumps({'run_id':rid,'totals':None}).encode(),json.dumps({'run_id':rid,'totals':{'cost':-25}}).encode(),json.dumps({'run_id':rid,'totals':{'cost':float('nan')}}).encode(),json.dumps({'run_id':rid,'totals':{'cost':0},'active_seconds':-1}).encode(),json.dumps({'run_id':rid,'totals':{'cost':.025},'accounted_transcript_steps':0}).encode()):
             usage_path.write_bytes(broken)
             diagnostic=client.get(f'/api/runs/{rid}/session?summary=true')
             diagnostic.raise_for_status()

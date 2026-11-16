@@ -2,6 +2,14 @@ import json
 import os
 import re
 import secrets
+import tempfile
+from contextlib import contextmanager
+
+try:
+    import fcntl
+except ImportError:  # Windows, matching the API file publication lock.
+    fcntl = None
+    import msvcrt
 from copy import deepcopy
 from pathlib import Path
 from sqlalchemy import select, delete, func
@@ -67,6 +75,18 @@ def get(s,model,ident,*,for_update=False):
     obj=s.get(model,ident,with_for_update=True) if for_update else s.get(model,ident)
     if obj is None: error('NOT_FOUND',f'{model.__name__} {ident} does not exist',404)
     return obj
+# Project downloads and observed artifacts share one origin-isolation policy.
+# Active documents must download; passive previews remain sandboxed even when inline.
+_SAFE_INLINE_ARTIFACT_EXTENSIONS = ('.pdf', '.png', '.jpg', '.jpeg', '.gif', '.webp')
+
+
+def artifact_download_policy(path):
+    disposition = ('inline' if str(path).lower().endswith(_SAFE_INLINE_ARTIFACT_EXTENSIONS)
+                   else 'attachment')
+    return disposition, {'Cache-Control': 'no-store',
+                         'Content-Security-Policy': "sandbox; default-src 'none'"}
+
+
 def project_dir(project_id):
     if not project_id or any(c not in '0123456789abcdef-' for c in project_id): error('INVALID_ID','Invalid project identifier')
     return settings.data_dir/'projects'/project_id
@@ -186,26 +206,97 @@ def emit(s,project_id,event_type,data):
     s.add(Event(project_id=project_id,sequence=sequence,type=event_type,data=data))
     if sequence%100==0: s.execute(delete(Event).where(Event.project_id==project_id,Event.sequence<sequence-500))
 
-def secret_store():
-    p=settings.data_dir/'secrets.json'
-    if not p.exists(): p.write_text('{}'); p.chmod(0o600)
-    return p
+@contextmanager
+def _secret_lock():
+    # A separate, stable inode: locking secrets.json itself would not protect
+    # against another process replacing the file while the lock is held.
+    lock_path = settings.data_dir / 'secrets.json.lock'
+    with lock_path.open('a+b') as lock:
+        lock_path.chmod(0o600)
+        if fcntl:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        else:
+            lock.seek(0, 2)
+            if lock.tell() == 0:
+                lock.write(b'\0')
+                lock.flush()
+            lock.seek(0)
+            msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
+        try:
+            yield
+        finally:
+            if fcntl:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+            else:
+                lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
 
-def put_secret(value,ref=None):
-    ref=ref or uid(); p=secret_store(); data=json.loads(p.read_text()); data[ref]=value
-    tmp=p.with_suffix('.tmp'); tmp.write_text(json.dumps(data)); tmp.chmod(0o600); tmp.replace(p); return ref
+
+def _publish_secrets(path, data):
+    # The temporary file must be unique to this write and on the same
+    # filesystem as the destination. Flush bytes before the atomic rename.
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile('w', encoding='utf-8', dir=path.parent,
+                                         prefix='.secrets-', suffix='.tmp',
+                                         delete=False) as stream:
+            temporary = Path(stream.name)
+            json.dump(data, stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(path)
+        if os.name != 'nt':
+            descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def _secret_store_locked():
+    path = settings.data_dir / 'secrets.json'
+    if not path.exists():
+        _publish_secrets(path, {})
+    return path
+
+
+def secret_store():
+    with _secret_lock():
+        return _secret_store_locked()
+
+
+def put_secret(value, ref=None):
+    ref = ref or uid()
+    with _secret_lock():
+        path = _secret_store_locked()
+        data = json.loads(path.read_text())
+        data[ref] = value
+        _publish_secrets(path, data)
+    return ref
+
 
 def read_secret(ref):
-    return json.loads(secret_store().read_text()).get(ref,'') if ref else ''
+    if not ref:
+        return ''
+    with _secret_lock():
+        return json.loads(_secret_store_locked().read_text()).get(ref, '')
+
 
 def delete_secret(ref):
-    if not ref: return
-    p=settings.data_dir/'secrets.json'
-    if not p.exists(): return
-    data=json.loads(p.read_text())
-    if ref not in data: return
-    data.pop(ref,None)
-    tmp=p.with_suffix('.tmp'); tmp.write_text(json.dumps(data)); tmp.chmod(0o600); tmp.replace(p)
+    if not ref:
+        return
+    with _secret_lock():
+        path = settings.data_dir / 'secrets.json'
+        if not path.exists():
+            return
+        data = json.loads(path.read_text())
+        if ref not in data:
+            return
+        data.pop(ref)
+        _publish_secrets(path, data)
 
 def owner_token():
     if settings.owner_token: return settings.owner_token

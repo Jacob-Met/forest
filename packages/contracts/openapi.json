@@ -12022,7 +12022,7 @@
     },
     "/api/figures/{ident}/render": {
       "post": {
-        "description": "Capture figure_id/revision/data plus body overrides and return a queued Run. Optional body request_id/configuration is passed to the figure worker; outputs are available only after the task completes and its resource is updated.",
+        "description": "Capture figure_id/revision/data plus body overrides and return a queued Run. Optional body request_id/configuration is passed to the figure worker; outputs are available only after the task completes and its resource is updated. Figure code imported from a project archive is inert and uses native rendering until the owner explicitly reviews and edits it.",
         "operationId": "render_figure_api_figures__ident__render_post",
         "parameters": [
           {
@@ -16694,7 +16694,7 @@
     },
     "/api/projects/import": {
       "post": {
-        "description": "multipart/form-data file with forest-project-v1 manifest. Validate graph and archive paths, reject symlinks/path traversal, more than `max_project_archive_members` ZIP entries (default `10000`, configured by `FOREST_MAX_PROJECT_ARCHIVE_MEMBERS`), and >500 MiB decompressed archives. The member count includes directories and entries outside `files/`; rejection returns `413 ARCHIVE_TOO_LARGE` before manifest access or project creation. The configured limit must be a positive integer. Create a new project with remapped graph/resource identifiers; preserve its selected provider when that ID exists in the current workspace. If the saved provider is unavailable, mark provider_selection_required and prevent provider-backed runs from silently falling back until the owner edits project settings. Active imported work is interrupted and execution is not replayed.",
+        "description": "multipart/form-data file with forest-project-v1 manifest. Validate graph and archive paths, reject symlinks/path traversal, more than `max_project_archive_members` ZIP entries (default `10000`, configured by `FOREST_MAX_PROJECT_ARCHIVE_MEMBERS`), and >500 MiB decompressed archives. The member count includes directories and entries outside `files/`; rejection returns `413 ARCHIVE_TOO_LARGE` before manifest access or project creation. The configured limit must be a positive integer. Create a new project with remapped graph/resource identifiers; preserve its selected provider when that ID exists in the current workspace. If the saved provider is unavailable, mark provider_selection_required and prevent provider-backed runs from silently falling back until the owner edits project settings. Active imported work is interrupted and execution is not replayed. Non-renderer Python saved on imported figures is preserved as untrusted source: default rendering uses the built-in renderer, and the owner must edit and explicitly approve code before custom execution.",
         "operationId": "import_project_api_projects_import_post",
         "requestBody": {
           "content": {
@@ -17290,7 +17290,7 @@
     },
     "/api/projects/{ident}/download": {
       "get": {
-        "description": "FileResponse with inline Content-Disposition and the file's basename. Content type depends on its filename; use the response bytes/blob, not JSON. No text-size limit is applied here.",
+        "description": "Return exact file bytes with a sandboxed, non-cacheable response. Passive PDF and raster-image types render inline; other types, including active HTML/SVG and text documents, download as attachments so project output cannot run scripts on the application origin. Content type and filename come from the file; the response is not JSON. No text-size limit applies.",
         "operationId": "download_file_api_projects__ident__download_get",
         "parameters": [
           {

@@ -501,7 +501,7 @@ def system():
     provider_status=[provider_health(p) for p in providers]
     verified_model=any(p['available'] and provider.kind!='codex_cli' for p,provider in zip(provider_status,providers))
     codex_cli_signed_in=any(p['available'] and provider.kind=='codex_cli' for p,provider in zip(provider_status,providers))
-    return {'cpu_percent':psutil.cpu_percent(),'memory':{'total':vm.total,'used':vm.used,'percent':vm.percent},'disk':{'total':disk.total,'used':disk.used,'free':disk.free},'gpu':gpu,'workers':workers,'latex':shutil.which('tectonic') or shutil.which('pdflatex'),'model_connected':verified_model,'model_check_pending':codex_cli_signed_in and not verified_model,'provider_status':provider_status,'platform':os.uname().sysname,'isolation':'trusted_local_process'}
+    return {'cpu_percent':psutil.cpu_percent(),'memory':{'total':vm.total,'used':vm.used,'percent':vm.percent},'disk':{'total':disk.total,'used':disk.used,'free':disk.free},'gpu':gpu,'workers':workers,'latex':(shutil.which('tectonic') or shutil.which('pdflatex')) if shutil.which('bwrap') else None,'model_connected':verified_model,'model_check_pending':codex_cli_signed_in and not verified_model,'provider_status':provider_status,'platform':os.uname().sysname,'isolation':'trusted_local_process'}
 DEFAULT_SETTINGS = {'language':'en','theme':'light','retention_days':30,'default_mode':'assisted'}
 
 @app.get('/api/settings')
@@ -588,6 +588,7 @@ def provider_retire(ident:str,body:dict=Body(default={} )):
     replacement_id=body.get('replacement_provider_id')
     credential_ref=None
     with Session.begin() as s:
+        begin_sqlite_write(s)
         p=get(s,Provider,ident,for_update=True)
         replacement=None
         if replacement_id:
@@ -595,18 +596,27 @@ def provider_retire(ident:str,body:dict=Body(default={} )):
             replacement=get(s,Provider,replacement_id)
             if replacement.status=='retired': error('INVALID_REPLACEMENT','Replacement provider must be active',422)
         snapshot=provider_references(s,ident)
-        for project in s.scalars(select(Project)):
+        projects={project.id:project for project in s.scalars(select(Project).with_for_update())}
+        changed_projects=set()
+        for project in projects.values():
             config=dict(project.config or {})
             if config.get('provider_id')==ident:
                 if replacement: config['provider_id']=replacement.id
                 else: config.pop('provider_id',None)
                 project.config=config
+                changed_projects.add(project.id)
         for node in s.scalars(select(Node)):
             config=dict(node.config or {})
             if config.get('provider_id')==ident:
                 if replacement: config['provider_id']=replacement.id
                 else: config.pop('provider_id',None)
                 node.config=config
+                node.revision+=1
+                changed_projects.add(node.project_id)
+        for project_id in sorted(changed_projects):
+            project=projects[project_id]
+            project.revision+=1
+            emit(s,project_id,'project_changed',{'revision':project.revision})
         for agent in s.scalars(select(Agent).where(Agent.provider_id==ident)):
             agent.provider_id=replacement.id if replacement else None
         from services.observation.models import ReporterPolicy

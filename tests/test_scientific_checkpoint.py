@@ -143,6 +143,149 @@ def test_corrupt_usage_ledger_requires_reconciliation_without_overwrite(tmp_path
     assert path.read_text() == '{broken'
 
 
+
+@pytest.mark.parametrize('invalid', [
+    {'totals': {'cost': -25.0}},
+    {'totals': {'cost': float('nan')}},
+    {'totals': {'known_cost': float('inf')}},
+    {'totals': {'input_tokens': -1}},
+    {'totals': {'output_tokens': 1.5}},
+    {'totals': {'cached_input_tokens': True}},
+    {'totals': {'reasoning_tokens': '100'}},
+    {'totals': {'cost': False}},
+    {'active_seconds': -1.0},
+    {'active_seconds': float('nan')},
+    {'active_seconds': float('inf')},
+    {'active_seconds': True},
+    {'accounted_transcript_steps': -1},
+    {'accounted_transcript_steps': 0.2},
+    {'accounted_transcript_steps': True},
+    {'cost_complete': 1},
+    {'usage_complete': 'true'},
+])
+def test_invalid_supervisor_accounting_blocks_resume_without_mutating_ledger(tmp_path, invalid):
+    from research.agents.runtime import budget_reason
+    workspace = tmp_path / 'workspace'
+    workspace.mkdir()
+    ledger = {'run_id': 'isolated-run', 'totals': {'input_tokens': 100,
+        'output_tokens': 20, 'cost': 0.25}, 'active_seconds': 4.5,
+        'cost_complete': True, 'usage_complete': True,
+        'accounted_transcript_steps': 1}
+    ledger.update(invalid)
+    path = tmp_path / 'agent_usage.json'
+    path.write_text(json.dumps(ledger))
+    original = path.read_bytes()
+    state = {'run_id': 'isolated-run', 'transcript': [{'step': 1}],
+        'totals': {'cost': 0.25}, 'active_seconds': 2}
+    with pytest.raises(ReconciliationRequired, match='invalid'):
+        load_accounting(state, workspace)
+    assert state['totals']['cost'] == 0.25
+    assert state['active_seconds'] == 2
+    assert path.read_bytes() == original
+
+
+
+@pytest.mark.parametrize(('totals', 'other', 'budget'), [
+    ({'cost': 0.1}, {}, {'input_tokens': 1}),
+    ({'input_tokens': 100}, {}, {'cost': 0.01}),
+    ({}, {}, {'output_tokens': 1}),
+    ({'cost': None}, {}, {'cost': 0.01}),
+    ({'cost': 0.1}, {'cost_complete': False}, {'cost': 1}),
+    ({'input_tokens': 11}, {'usage_complete': False}, {'input_tokens': 20}),
+    ({'input_tokens': 11}, {}, {'active_seconds': 1}),
+    ({'cost': 0.1}, {}, {'cost': 1}),
+    ({'input_tokens': 11}, {}, {'input_tokens': 20}),
+])
+def test_resume_rejects_unverifiable_budgeted_usage(tmp_path, totals, other, budget):
+    workspace = tmp_path / 'workspace'
+    workspace.mkdir()
+    ledger = {'run_id': 'r', 'totals': totals, 'accounted_transcript_steps': 1, **other}
+    path = tmp_path / 'agent_usage.json'
+    path.write_text(json.dumps(ledger))
+    original = path.read_bytes()
+    state = {'run_id': 'r', 'transcript': [{'step': 1}]}
+    with pytest.raises(ReconciliationRequired, match='budget'):
+        load_accounting(state, workspace, config={'agent_budget': budget})
+    assert state == {'run_id': 'r', 'transcript': [{'step': 1}]}
+    assert path.read_bytes() == original
+
+
+def test_resume_accepts_complete_budgeted_usage(tmp_path):
+    workspace = tmp_path / 'workspace'
+    workspace.mkdir()
+    ledger = {'run_id': 'r', 'totals': {'input_tokens': 10, 'output_tokens': 4, 'cost': .01},
+        'active_seconds': 2, 'cost_complete': True, 'usage_complete': True,
+        'accounted_transcript_steps': 1}
+    (tmp_path / 'agent_usage.json').write_text(json.dumps(ledger))
+    state = {'run_id': 'r', 'transcript': [{'step': 1}]}
+    load_accounting(state, workspace, config={'agent_budget': {
+        'input_tokens': 20, 'output_tokens': 10, 'cost': .5, 'active_seconds': 10}})
+    assert state['totals'] == ledger['totals']
+
+
+def test_budgeted_resume_rejects_ledger_missing_checkpoint_steps(tmp_path):
+    workspace = tmp_path / 'workspace'
+    workspace.mkdir()
+    ledger = {'run_id': 'r', 'totals': {'cost': 0.1}, 'cost_complete': True}
+    path = tmp_path / 'agent_usage.json'
+    path.write_text(json.dumps(ledger))
+    state = {'run_id': 'r', 'transcript': [{'step': 1}]}
+    with pytest.raises(ReconciliationRequired, match='budget'):
+        load_accounting(state, workspace, config={'agent_budget': {'cost': 1}})
+    assert path.read_text() == json.dumps(ledger)
+
+
+def test_ledger_behind_checkpoint_requires_reconciliation(tmp_path):
+    workspace = tmp_path / 'workspace'
+    workspace.mkdir()
+    ledger = {'run_id': 'r', 'totals': {'cost': .1}, 'accounted_transcript_steps': 0}
+    (tmp_path / 'agent_usage.json').write_text(json.dumps(ledger))
+    with pytest.raises(ReconciliationRequired, match='behind'):
+        load_accounting({'run_id': 'r', 'transcript': [{'step': 1}]}, workspace)
+
+
+def test_supervisor_accounting_accepts_incomplete_cost_and_legacy_omissions(tmp_path):
+    workspace = tmp_path / 'workspace'
+    workspace.mkdir()
+    ledger = {'run_id': 'isolated-run',
+        'totals': {'input_tokens': 11, 'output_tokens': 3,
+            'cost': None, 'known_cost': 0.15},
+        'active_seconds': 0.1, 'cost_complete': False,
+        'usage_complete': False, 'accounted_transcript_steps': 1}
+    (tmp_path / 'agent_usage.json').write_text(json.dumps(ledger))
+    state = {'run_id': 'isolated-run', 'transcript': [{'step': 1}]}
+    load_accounting(state, workspace)
+    assert state['totals'] == ledger['totals']
+    assert state['active_seconds'] == 0.1
+    assert state['cost_complete'] is False and state['usage_complete'] is False
+    # Old ledgers do not necessarily include all accounting fields.
+    (tmp_path / 'agent_usage.json').write_text(json.dumps({
+        'run_id': 'isolated-run', 'totals': {}}))
+    load_accounting(state, workspace)
+
+
+def test_legacy_embedded_bad_cost_still_blocks_resume(tmp_path):
+    state = {'run_id': 'old-run', 'transcript': [], 'totals': {'cost': -10}}
+    with pytest.raises(ReconciliationRequired, match='invalid'):
+        load_accounting(state, tmp_path)
+
+
+def test_worker_recovery_rejects_bad_external_ledger(tmp_path):
+    from services.worker.main import _agent_checkpoint
+    run_id = 'test-resume'
+    workspace = tmp_path / 'workspace'
+    workspace.mkdir()
+    (workspace / 'agent_session.json').write_text(json.dumps({
+        'run_id': run_id, 'transcript': [], 'status': 'waiting'}))
+    path = tmp_path / 'agent_usage.json'
+    path.write_text(json.dumps({'run_id': run_id, 'totals': {'cost': -2}}))
+    assert _agent_checkpoint(tmp_path, run_id) is None
+    path.write_text(json.dumps({'run_id': run_id, 'totals': {'cost': 0.2}}))
+    assert _agent_checkpoint(tmp_path, run_id)['totals']['cost'] == 0.2
+    path.write_text(json.dumps({'run_id': run_id, 'totals': {'cost': 0.2}, 'accounted_transcript_steps': 1}))
+    assert _agent_checkpoint(tmp_path, run_id) is None
+
+
 def test_successful_comment_only_reexecution_does_not_reset_progress(tmp_path):
     context = {'evidence_state': 'unchanged', 'nodes': []}
     state = {'execution_snapshot': {'job_bindings': {'action-one': {'job_id': 'job-one', 'progress_identity': 'same-semantics'},

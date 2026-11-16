@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 import json
+import math
 import time
 import uuid
 from pathlib import Path
@@ -187,7 +188,63 @@ class ReconciliationRequired(ValueError):
     """Persisted side effects cannot safely be replayed from this checkpoint."""
 
 
-def load_accounting(state, workspace):
+def validate_accounting_ledger(ledger, run_id, *, transcript_steps=None, config=None):
+    """Validate a persisted supervisor ledger before treating its usage as trusted."""
+    def invalid(field):
+        raise ReconciliationRequired(
+            f'Supervisory usage ledger has invalid {field}; reconcile accounting before resuming')
+
+    if not isinstance(ledger, dict) or ledger.get('run_id') != run_id:
+        invalid('run identity')
+    totals = ledger.get('totals')
+    if not isinstance(totals, dict):
+        invalid('totals')
+    for key, value in totals.items():
+        if not isinstance(key, str):
+            invalid('totals field name')
+        if key.endswith('_tokens'):
+            if type(value) is not int or value < 0:
+                invalid(f'totals.{key}')
+        elif key == 'cost' and value is None:
+            # Unknown billed cost is distinct from a confirmed zero cost.
+            continue
+        elif type(value) not in (int, float) or value < 0 or (type(value) is float and not math.isfinite(value)):
+            invalid(f'totals.{key}')
+    seconds = ledger.get('active_seconds', 0)
+    if type(seconds) not in (int, float) or seconds < 0 or (type(seconds) is float and not math.isfinite(seconds)):
+        invalid('active_seconds')
+    steps = ledger.get('accounted_transcript_steps', 0)
+    if type(steps) is not int or steps < 0:
+        invalid('accounted_transcript_steps')
+    for key in ('cost_complete', 'usage_complete'):
+        if key in ledger and type(ledger[key]) is not bool:
+            invalid(key)
+    if transcript_steps is not None and 'accounted_transcript_steps' in ledger:
+        if steps > transcript_steps:
+            raise ReconciliationRequired('Supervisory ledger advanced beyond the scientific checkpoint; reconcile ModelRequest receipts before another model call')
+        if steps < transcript_steps:
+            raise ReconciliationRequired('Supervisory ledger is behind the scientific checkpoint; reconcile ModelRequest receipts before another model call')
+    # A configured budget is not safe to enforce against missing or partial usage.
+    budgets = (config or {}).get('agent_budget') or {}
+    has_budgeted_usage = False
+    for key in ('input_tokens', 'output_tokens', 'cost', 'active_seconds'):
+        limit = budgets.get(key)
+        if limit is None or float(limit) <= 0:
+            continue
+        has_budgeted_usage = True
+        value = ledger.get('active_seconds') if key == 'active_seconds' else totals.get(key)
+        if value is None:
+            invalid(f'budget {key} (usage unavailable)')
+        if key == 'cost' and ledger.get('cost_complete') is not True:
+            invalid('budget cost (accounting incomplete)')
+        if key.endswith('_tokens') and ledger.get('usage_complete') is not True:
+            invalid(f'budget {key} (accounting incomplete)')
+    if has_budgeted_usage and transcript_steps and 'accounted_transcript_steps' not in ledger:
+        invalid('budget checkpoint step count unavailable')
+    return ledger
+
+
+def load_accounting(state, workspace, config=None):
     """Migrate old sessions into the separate supervisory ledger, never reset it."""
     from .processes import read_json
     path = Path(workspace).parent / 'agent_usage.json'
@@ -198,16 +255,19 @@ def load_accounting(state, workspace):
             ledger = read_json(path)
         except (ValueError, OSError, UnicodeError) as exc:
             raise ReconciliationRequired('External usage ledger cannot be read; reconcile the original supervisor accounting') from exc
-        if not isinstance(ledger, dict) or ledger.get('run_id') != state['run_id'] or not isinstance(ledger.get('totals'), dict):
-            raise ReconciliationRequired('Supervisory usage ledger is invalid; reconcile accounting before resuming')
+        validate_accounting_ledger(ledger, state['run_id'],
+                                   transcript_steps=len(state.get('transcript', [])), config=config)
         binding = state.get('execution_snapshot', {}).get('external_ledger_id')
         if binding and ledger.get('external_ledger_id') and binding != ledger['external_ledger_id']:
             raise ReconciliationRequired('Checkpoint and external ledger bind different supervisors; reconnect the original ledger')
-        if ledger.get('accounted_transcript_steps', 0) > len(state.get('transcript', [])):
-            raise ReconciliationRequired('Supervisory ledger advanced beyond the scientific checkpoint; reconcile ModelRequest receipts before another model call')
         state.update({key: ledger[key] for key in ACCOUNTING_FIELDS if key in ledger})
     elif 'totals' not in state and state.get('transcript'):
         raise ReconciliationRequired('Existing scientific checkpoint has no external usage ledger; reconnect the original supervisor rather than initialize new accounting')
+    elif 'totals' in state:
+        # Pre-migration checkpoints can still embed their own accounting.
+        validate_accounting_ledger({'run_id': state['run_id'],
+            **{key: state[key] for key in ACCOUNTING_FIELDS if key in state}}, state['run_id'],
+            config=config if state.get('transcript') else None)
     state.setdefault('totals', {'input_tokens': 0, 'output_tokens': 0, 'cost': None})
     state.setdefault('active_seconds', 0)
 

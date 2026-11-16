@@ -2403,6 +2403,25 @@ td.numeric {
   background: #f2f7eb;
   color: #68884e;
 }
+.figure-import-warning {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 11px 13px;
+  margin: -8px 0 18px;
+  border: 1px solid var(--line);
+  border-left: 3px solid #a77932;
+  border-radius: 7px;
+  background: var(--surface);
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.55;
+}
+.figure-import-warning svg {
+  flex: 0 0 auto;
+  margin-top: 1px;
+  color: #a77932;
+}
 .figure-workbench {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 270px;

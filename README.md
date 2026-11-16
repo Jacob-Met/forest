@@ -150,7 +150,7 @@ saved run, metrics, or retained input. Starting another paired run creates a
 distinct run-local input artifact. This records bytes at worker consumption,
 not at enqueue time, and is not a general file-version history.
 
-PDF compilation requires `tectonic` or `pdflatex`. Configure spending and execution limits before unattended runs, and keep credentials outside the repository.
+PDF compilation on Linux requires `bubblewrap` (`bwrap`, with unprivileged mount/user namespaces permitted) and `tectonic` or `pdflatex`. Each manuscript is compiled in an OS-level mount namespace that exposes the paper bundle and public TeX runtime, not the host's home, project parents or credentials. When `bwrap` is missing, compilation is unavailable rather than unrestricted. Tectonic runs offline in that namespace: prefetch its public package cache with python scripts/prime_tectonic_cache.py during installation (the CI setup demonstrates this); un-cached packages will fail instead of silently enabling untrusted reads or network access. Configure spending and execution limits before unattended runs, and keep credentials outside the repository.
 
 See [Deployment](https://github.com/mikamikasuki/FOREST/blob/main/docs/DEPLOYMENT.md) for Docker, PostgreSQL, background services, backups, and Windows via WSL2 or Docker Desktop. See [Security](https://github.com/mikamikasuki/FOREST/blob/main/SECURITY.md) for execution boundaries.
 
