@@ -88,18 +88,24 @@ def serve(*, host="127.0.0.1", port=8000, data_dir=None, database_url=None, head
         raise KeyboardInterrupt
 
     try:
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            previous_handlers[signum] = signal.signal(signum, stop)
         _prepare_web(headless=headless, dev=dev, env=env)
-        # Importing the CLI/help must never create a database. Initialization is
-        # confined to an explicit serve invocation in a separate interpreter.
-        subprocess.run([sys.executable, "-m", "services.api.db"], cwd=ROOT, env=env, check=True)
+        # Importing the CLI/help must never create a database. Track the
+        # initializer as a child before waiting: SIGTERM must stop it too.
+        initializer_command = [sys.executable, "-m", "services.api.db"]
+        initializer = subprocess.Popen(initializer_command, cwd=ROOT, env=env)
+        children.append(initializer)
+        result = initializer.wait()
+        children.remove(initializer)
+        if result != 0:
+            raise subprocess.CalledProcessError(result, initializer_command)
         commands = [
             ([sys.executable, "-m", "uvicorn", "services.api.main:app", "--host", host, "--port", str(port), "--timeout-graceful-shutdown", "5"], ROOT),
             ([sys.executable, "-m", "services.worker.main"], ROOT),
         ]
         if dev:
             commands.append((["npm", "run", "dev", "--", "--host", host], ROOT / "apps" / "web"))
-        for signum in (signal.SIGINT, signal.SIGTERM):
-            previous_handlers[signum] = signal.signal(signum, stop)
         for command, cwd in commands:
             children.append(subprocess.Popen(command, cwd=cwd, env=env))
         endpoint_host = f"[{host}]" if ":" in host else host

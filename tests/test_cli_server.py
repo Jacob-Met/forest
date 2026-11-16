@@ -40,7 +40,7 @@ class Child:
         self.killed = True
         self.exit_code = -9
 
-    def wait(self, timeout):
+    def wait(self, timeout=None):
         self.waited.append(timeout)
         if self.timeout and not self.killed:
             raise subprocess.TimeoutExpired("child", timeout)
@@ -57,7 +57,7 @@ def supervised(monkeypatch, tmp_path):
         return subprocess.CompletedProcess(command, 0)
 
     def spawn(command, **kwargs):
-        child = Child()
+        child = Child(exit_code=0 if command[1:] == ["-m", "services.api.db"] else None)
         calls.spawn.append((command, kwargs))
         calls.children.append(child)
         return child
@@ -85,6 +85,61 @@ def test_server_import_has_no_api_or_data_side_effects(tmp_path):
     )
     assert result.returncode == 0, result.stderr
     assert not data.exists()
+
+
+def test_sigterm_during_real_initializer_reaps_startup_process(tmp_path):
+    """Stopping serve must not leave a database initializer running after it exits."""
+    import psutil
+    import time
+
+    marker = tmp_path / 'initializer-pid'
+    initializer = ('import os,sys,time;from pathlib import Path;'
+                   'Path(sys.argv[1]).write_text(str(os.getpid()));time.sleep(60)')
+    launcher = f"""
+import subprocess,sys
+from forest_cli import server
+real_spawn = subprocess.Popen
+initializer_code = {initializer!r}
+marker = {str(marker)!r}
+def intercept(command, *args, **kwargs):
+    if isinstance(command, (list, tuple)) and list(command[1:]) == ['-m', 'services.api.db']:
+        return real_spawn([sys.executable, '-c', initializer_code, marker], *args, **kwargs)
+    return real_spawn(command, *args, **kwargs)
+server.subprocess.Popen = intercept
+raise SystemExit(server.serve(headless=True, data_dir={str(tmp_path / 'database')!r}))
+"""
+    env = {**os.environ, 'PYTHONPATH': str(Path(__file__).resolve().parents[1])}
+    parent = subprocess.Popen([sys.executable, '-c', launcher],
+                              cwd=Path(__file__).resolve().parents[1], env=env,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    init_pid = None
+    try:
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and not marker.exists():
+            assert parent.poll() is None, 'serve exited before starting initializer'
+            time.sleep(0.02)
+        assert marker.exists(), 'initializer never reached startup'
+        init_pid = int(marker.read_text())
+        assert psutil.pid_exists(init_pid)
+        parent.send_signal(signal.SIGTERM)
+        parent.wait(timeout=12)
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            if not psutil.pid_exists(init_pid) or psutil.Process(init_pid).status() == psutil.STATUS_ZOMBIE:
+                break
+            time.sleep(0.04)
+        assert (not psutil.pid_exists(init_pid) or psutil.Process(init_pid).status() == psutil.STATUS_ZOMBIE), (
+            'database initializer survived terminated FOREST parent')
+    finally:
+        if parent.poll() is None:
+            parent.kill(); parent.wait(timeout=5)
+        if init_pid and psutil.pid_exists(init_pid):
+            try:
+                process = psutil.Process(init_pid)
+                if process.status() != psutil.STATUS_ZOMBIE:
+                    process.kill()
+            except psutil.NoSuchProcess:
+                pass
 
 
 def test_data_directory_selects_matching_sqlite_without_mutating_env(clean_server_env, tmp_path):
@@ -138,35 +193,39 @@ def test_headless_launches_only_api_and_worker_and_cleans_up(supervised, monkeyp
     monkeypatch.setattr(server.shutil, "which", lambda _: pytest.fail("Headless startup must not inspect Node/npm"))
     data = tmp_path / "data"
     assert server.serve(headless=True, port=8123, data_dir=data) == 0
-    assert [command[:3] for command, _ in supervised.run] == [[sys.executable, "-m", "services.api.db"]]
-    assert supervised.spawn[0][0] == [sys.executable, "-m", "uvicorn", "services.api.main:app", "--host", "127.0.0.1", "--port", "8123", "--timeout-graceful-shutdown", "5"]
-    assert supervised.spawn[1][0] == [sys.executable, "-m", "services.worker.main"]
-    assert all(options["env"]["FOREST_DATABASE_URL"] == "sqlite:///" + str(data / "forest.db") for _, options in supervised.run + supervised.spawn)
-    assert all(child.terminated and child.waited == [10] for child in supervised.children)
+    assert supervised.run == []
+    assert supervised.spawn[0][0] == [sys.executable, "-m", "services.api.db"]
+    assert supervised.spawn[1][0] == [sys.executable, "-m", "uvicorn", "services.api.main:app", "--host", "127.0.0.1", "--port", "8123", "--timeout-graceful-shutdown", "5"]
+    assert supervised.spawn[2][0] == [sys.executable, "-m", "services.worker.main"]
+    assert all(options["env"]["FOREST_DATABASE_URL"] == "sqlite:///" + str(data / "forest.db") for _, options in supervised.spawn)
+    assert supervised.children[0].waited == [None] and not supervised.children[0].terminated
+    assert all(child.terminated and child.waited == [10] for child in supervised.children[1:])
     assert supervised.signals[-2:] == [(signal.SIGINT, signal.SIG_DFL), (signal.SIGTERM, signal.SIG_DFL)]
 
 
 def test_child_failure_propagates_exit_and_stops_peer(supervised, monkeypatch):
     def spawn(command, **kwargs):
-        child = Child(exit_code=7 if not supervised.children else None)
+        child = Child(exit_code=0 if not supervised.children else 7 if len(supervised.children)==1 else None)
         supervised.children.append(child)
         return child
     monkeypatch.setattr(server.subprocess, "Popen", spawn)
     assert server.serve(headless=True) == 7
     assert not supervised.children[0].terminated
-    assert supervised.children[1].terminated
+    assert not supervised.children[1].terminated
+    assert supervised.children[2].terminated
 
 
 def test_partial_launch_failure_cleans_existing_child(supervised, monkeypatch):
     def spawn(command, **kwargs):
-        if supervised.children:
+        if len(supervised.children) == 2:
             raise OSError("worker launch failed")
-        child = Child()
+        child = Child(exit_code=0 if not supervised.children else None)
         supervised.children.append(child)
         return child
     monkeypatch.setattr(server.subprocess, "Popen", spawn)
     assert server.serve(headless=True) == 1
-    assert supervised.children[0].terminated
+    assert not supervised.children[0].terminated
+    assert supervised.children[1].terminated
 
 
 def test_unresponsive_children_are_killed_then_reaped():
