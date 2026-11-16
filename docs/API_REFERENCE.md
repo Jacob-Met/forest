@@ -670,7 +670,7 @@ Known domain failures: `400` INVALID_ARCHIVE, UNSAFE_ARCHIVE or graph validation
 
 #### `GET /api/projects/{ident}/download`
 
-FileResponse with inline Content-Disposition and the file's basename. Content type depends on its filename; use the response bytes/blob, not JSON. No text-size limit is applied here.
+Return exact file bytes with a sandboxed, non-cacheable response. Passive PDF and raster-image types render inline; other types, including active HTML/SVG and text documents, download as attachments so project output cannot run scripts on the application origin. Content type and filename come from the file; the response is not JSON. No text-size limit applies.
 
 | Parameter | Location | Type | Required | Default / description |
 | --- | --- | --- | --- | --- |

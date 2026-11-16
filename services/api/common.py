@@ -67,6 +67,18 @@ def get(s,model,ident,*,for_update=False):
     obj=s.get(model,ident,with_for_update=True) if for_update else s.get(model,ident)
     if obj is None: error('NOT_FOUND',f'{model.__name__} {ident} does not exist',404)
     return obj
+# Project downloads and observed artifacts share one origin-isolation policy.
+# Active documents must download; passive previews remain sandboxed even when inline.
+_SAFE_INLINE_ARTIFACT_EXTENSIONS = ('.pdf', '.png', '.jpg', '.jpeg', '.gif', '.webp')
+
+
+def artifact_download_policy(path):
+    disposition = ('inline' if str(path).lower().endswith(_SAFE_INLINE_ARTIFACT_EXTENSIONS)
+                   else 'attachment')
+    return disposition, {'Cache-Control': 'no-store',
+                         'Content-Security-Policy': "sandbox; default-src 'none'"}
+
+
 def project_dir(project_id):
     if not project_id or any(c not in '0123456789abcdef-' for c in project_id): error('INVALID_ID','Invalid project identifier')
     return settings.data_dir/'projects'/project_id
