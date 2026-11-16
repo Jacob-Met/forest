@@ -194,6 +194,50 @@ def test_declared_semantic_route_defect_requires_replanning(kind):
     assert validate_route_review(report, context)['decision'] == 'replan'
 
 
+@pytest.mark.parametrize('invalid_kind', ['goal_drit', 'blocked', 'GOAL_DRIFT', None, 123, ['goal_drift'], {'kind': 'goal_drift'}])
+def test_route_review_rejects_unknown_finding_kinds_before_continue(invalid_kind):
+    from research.planning.route_review import validate_route_review
+    from test_evidence_workflow import idea
+    recommendation = {**idea(), 'research_question': 'Does the integration method retain accuracy?',
+        'success_event': 'Lower absolute error on the selected integrand at equal evaluations.'}
+    context = {'coverage': {'node_ids': ['actual-method'], 'run_ids': [], 'resource_ids': []},
+        'route_health': {'replan_required': False}}
+    report = {'decision': 'continue', 'summary': 'Current route abandons original goal.',
+        'coverage': deepcopy(context['coverage']), 'findings': [{
+            'kind': invalid_kind, 'finding': 'Actual method has drifted away from original goal.',
+            'node_ids': ['actual-method'], 'run_ids': []}],
+        'stop_node_ids': ['actual-method'], 'recommendation': recommendation}
+    with pytest.raises(ValueError, match='finding kind'):
+        validate_route_review(report, context)
+    # An unknown label must never become harmless just by changing advice.
+    report['decision'] = 'replan'
+    with pytest.raises(ValueError, match='finding kind'):
+        validate_route_review(report, context)
+
+
+def test_route_review_allows_other_and_requires_replan_for_blocking_kinds():
+    from research.planning.route_review import validate_route_review
+    from test_evidence_workflow import idea
+    recommendation = {**idea(), 'research_question': 'Does the integration method retain accuracy?',
+        'success_event': 'Lower absolute error on the selected integrand at equal evaluations.'}
+    context = {'coverage': {'node_ids': ['actual-method'], 'run_ids': [], 'resource_ids': []},
+        'route_health': {'replan_required': False}}
+    report = {'decision': 'continue', 'summary': 'A nonblocking note does not change direction.',
+        'coverage': deepcopy(context['coverage']), 'findings': [{
+            'kind': 'other', 'finding': 'Work has a small unrelated documentation gap.',
+            'node_ids': ['actual-method'], 'run_ids': []}],
+        'stop_node_ids': [], 'recommendation': recommendation}
+    assert validate_route_review(report, context)['decision'] == 'continue'
+    for blocking in ('goal_drift', 'error_accumulation', 'repeated_failure', 'tunnel_vision',
+                     'excessive_counterexample_checks'):
+        report['findings'][0]['kind'] = blocking
+        with pytest.raises(ValueError, match='route defects require a new direction'):
+            validate_route_review(report, context)
+        report['decision'] = 'replan'
+        assert validate_route_review(report, context)['decision'] == 'replan'
+        report['decision'] = 'continue'
+
+
 def test_route_context_reads_complete_actual_records_and_files_and_budget(route_worker):
     h = route_worker
     project = h.request('POST', '/api/projects', json={
