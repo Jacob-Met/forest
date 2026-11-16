@@ -31,6 +31,7 @@ class AnalysisRequest(BaseModel):
     literature_limit: int = Field(default=6, ge=1, le=12)
     timeout: float = Field(default=180, gt=0, le=3600)
     provider_id: str | None = None
+    expected_provider_id: str | None = None
 
 
 def analysis_provider(session, project):
@@ -87,8 +88,19 @@ def submit_analysis(ident: str, body: AnalysisRequest):
                                          include_materials=True)
         if body.expected_fingerprint and body.expected_fingerprint != context['snapshot']['fingerprint']:
             error('CONTEXT_CHANGED', 'Run results or source records changed. Review the refreshed analysis context.', 409)
+        # The web panel reviews the Researcher selection as well as source
+        # context. Explicit API callers may choose an alternate provider, but
+        # a panel request must match its reviewed provider at dispatch.
+        if body.expected_provider_id is not None:
+            selected = analysis_provider(session, project)
+            if (not selected['available'] or selected['id'] != body.expected_provider_id
+                    or (body.provider_id and body.provider_id != body.expected_provider_id)):
+                error('PROVIDER_SELECTION_CHANGED',
+                      'The selected Researcher provider changed. Review the current model before analysis.', 409,
+                      suggestion='Use current context in Research Analysis to bind the draft to the current provider.')
         config = {key: value for key, value in intent.items() if key not in (
-            'request_id', 'expected_revision', 'expected_fingerprint', 'scope', 'node_id', 'branch_id')}
+            'request_id', 'expected_revision', 'expected_fingerprint', 'expected_provider_id',
+            'scope', 'node_id', 'branch_id')}
         config.update(analysis_intent=fingerprint, analysis_scope=body.scope,
                       analysis_node_id=context['focus']['node_id'], analysis_branch_id=context['focus']['branch_id'],
                       analysis_project_revision=project.revision)

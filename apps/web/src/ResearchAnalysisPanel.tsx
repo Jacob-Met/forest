@@ -16,6 +16,7 @@ import {
 } from "./ui";
 import {
   acknowledgeAnalysisIntent,
+  analysisDraftIsStale,
   analysisDraftKey,
   analysisReferenceUrl,
   analysisReportMarkdown,
@@ -784,10 +785,14 @@ function AnalysisSession({
     null,
   );
   const result = detail.data?.run_id === selected?.id ? detail.data : null;
-  const changed =
+  const providerChanged =
     draft.baseRevision !== null &&
-    (draft.baseRevision !== context.snapshot.project_revision ||
-      draft.baseFingerprint !== context.snapshot.fingerprint);
+    draft.providerId !== (context.provider.id || "");
+  const changed = analysisDraftIsStale(draft, {
+    projectRevision: context.snapshot.project_revision,
+    fingerprint: context.snapshot.fingerprint,
+    providerId: context.provider.id || "",
+  });
   useEffect(() => {
     if (!selected) return;
     const refresh = () => void detail.reload();
@@ -874,8 +879,12 @@ function AnalysisSession({
         {changed && (
           <p role="status">
             {t(
-              "上下文已改变；当前草稿保留原版本。",
-              "Context changed; this draft retains its original revision.",
+              providerChanged
+                ? "分析模型已更改；草稿仍指向此前的模型。请使用当前上下文后再提交。"
+                : "上下文已改变；当前草稿保留原版本。",
+              providerChanged
+                ? "Analysis model changed; this draft still targets the previous provider. Use current context before requesting analysis."
+                : "Context changed; this draft retains its original revision.",
             )}
           </p>
         )}
@@ -901,10 +910,15 @@ function AnalysisSession({
             disabled={
               !context.provider.available ||
               !draft.providerId ||
-              draft.baseRevision === null
+              draft.baseRevision === null ||
+              changed
             }
             onClick={async () => {
-              if (lock.current || draftRef.current.baseRevision === null)
+              if (
+                lock.current ||
+                changed ||
+                draftRef.current.baseRevision === null
+              )
                 return;
               lock.current = true;
               setBusy(true);
@@ -915,6 +929,7 @@ function AnalysisSession({
                 {
                   expected_revision: current.baseRevision!,
                   expected_fingerprint: current.baseFingerprint,
+                  expected_provider_id: current.providerId,
                   scope,
                   ...(scope === "node" ? { node_id: nodeId } : {}),
                   ...(scope === "branch" ? { branch_id: branchId } : {}),

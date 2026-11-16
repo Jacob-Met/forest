@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   acknowledgeAnalysisIntent,
+  analysisDraftIsStale,
   analysisDraftKey,
   analysisReferenceUrl,
   analysisReportMarkdown,
@@ -22,6 +23,7 @@ const payload: AnalysisPayload = {
   node_id: "full-node-id",
   expected_revision: 4,
   expected_fingerprint: "original-snapshot",
+  expected_provider_id: "original-provider",
   question: draft.question,
   language: "en",
   provider_id: draft.providerId,
@@ -30,6 +32,34 @@ const payload: AnalysisPayload = {
   timeout: 180,
 };
 describe("research analysis saved intent", () => {
+  it("marks a saved draft stale when only the selected Researcher provider changes", () => {
+    const context = {
+      projectRevision: draft.baseRevision!,
+      fingerprint: draft.baseFingerprint,
+      providerId: draft.providerId,
+    };
+    expect(analysisDraftIsStale(draft, context)).toBe(false);
+    expect(
+      analysisDraftIsStale(draft, {
+        ...context,
+        providerId: "replacement-provider",
+      }),
+    ).toBe(true);
+    expect(analysisDraftIsStale(draft, { ...context, providerId: "" })).toBe(
+      true,
+    );
+    expect(
+      analysisDraftIsStale(
+        {
+          ...draft,
+          providerId: "replacement-provider",
+          intent: retainAnalysisIntent(draft, payload, () => "original-attempt")
+            .intent,
+        },
+        { ...context, providerId: "replacement-provider" },
+      ),
+    ).toBe(false);
+  });
   it("reuses the exact revision/provider/request identity after uncertain transport", () => {
     const first = retainAnalysisIntent(
       draft,
@@ -44,6 +74,9 @@ describe("research analysis saved intent", () => {
       "original-snapshot",
     );
     expect(first.intent?.payload.provider_id).toBe("original-provider");
+    expect(first.intent?.payload.expected_provider_id).toBe(
+      "original-provider",
+    );
     expect(
       retainAnalysisIntent(
         first,
