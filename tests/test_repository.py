@@ -298,3 +298,53 @@ def test_source_receipt_cannot_be_a_symlink(tmp_path):
     with pytest.raises(RepositoryError, match='not symlinks'):
         prepare_repository({'url':'https://github.com/example/research'},output/'workspace',output)
     assert external.read_text()=='{}'
+
+
+def test_restart_recovers_source_published_before_receipt(tmp_path, local_git, monkeypatch):
+    """A crashed receipt write must not strand this run's already-published checkout."""
+    _origin, first, _latest, calls = local_git
+    workspace, output = tmp_path / 'run' / 'workspace', tmp_path / 'run'
+    spec = {'url': 'https://github.com/example/research', 'ref': 'v1'}
+    real_write = repository._write_manifest
+
+    def fail_receipt(path, manifest, **kwargs):
+        if path.name == 'repository.json':
+            raise OSError('simulated power loss before source receipt')
+        return real_write(path, manifest, **kwargs)
+
+    with monkeypatch.context() as injected:
+        injected.setattr(repository, '_write_manifest', fail_receipt)
+        with pytest.raises(OSError, match='simulated power loss'):
+            prepare_repository(spec, workspace, output)
+    source = workspace / 'source'
+    assert source.is_dir() and (source / '.git').is_dir()
+    assert not (output / 'repository.json').exists()
+    calls_before = len(calls)
+    recovered = prepare_repository(spec, workspace, output)
+    assert recovered['commit'] == first
+    assert json.loads((output / 'repository.json').read_text()) == recovered
+    assert (source / 'calculation.py').read_text() == 'print(6 * 7)\n'
+    assert not any(command[0] in ('clone', 'fetch') for command in calls[calls_before:])
+
+
+def test_missing_receipt_does_not_adopt_unverified_or_dirty_checkout(tmp_path, local_git, monkeypatch):
+    _origin, _, _, _ = local_git
+    workspace, output = tmp_path / 'run' / 'workspace', tmp_path / 'run'
+    spec = {'url': 'https://github.com/example/research', 'ref': 'v1'}
+    real_write = repository._write_manifest
+
+    def fail_receipt(path, manifest, **kwargs):
+        if path.name == 'repository.json':
+            raise OSError('simulated interruption')
+        return real_write(path, manifest, **kwargs)
+
+    with monkeypatch.context() as injected:
+        injected.setattr(repository, '_write_manifest', fail_receipt)
+        with pytest.raises(OSError):
+            prepare_repository(spec, workspace, output)
+    checkout = workspace / 'source'
+    (checkout / 'calculation.py').write_text('changed after crash\n')
+    with pytest.raises(RepositoryError, match='mismatch|occupied|changed|dirty'):
+        prepare_repository(spec, workspace, output)
+    assert (checkout / 'calculation.py').read_text() == 'changed after crash\n'
+    assert not (output / 'repository.json').exists()

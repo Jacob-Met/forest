@@ -71,6 +71,28 @@ if __name__=='__main__':
         assert not (clone_output/'execution.json').exists()
         assert not (clone_output/'metrics.json').exists()
 
+        # The executor can crash after publishing its source tree but before
+        # recording its separate output receipt. Re-enter that same run.
+        interrupted_id, interrupted_output = queue('repository_clone',
+            {'repository': spec}, 'interrupted-source-receipt')
+        real_write = repository._write_manifest
+        def interrupted_receipt(path, manifest, **kwargs):
+            if path.name == 'repository.json':
+                raise OSError('lost repository receipt write')
+            return real_write(path, manifest, **kwargs)
+        with patch.object(repository, '_write_manifest', interrupted_receipt):
+            try:
+                execute(interrupted_id)
+            except OSError as error:
+                assert 'lost repository receipt' in str(error)
+            else:
+                raise AssertionError('Interrupted executor published no outer receipt')
+        assert (interrupted_output/'workspace/source/.git/forest-source-publication.json').is_file()
+        assert not (interrupted_output/'repository.json').exists()
+        resumed_source = execute(interrupted_id)
+        assert resumed_source['commit'] == commit
+        assert json.loads((interrupted_output/'repository.json').read_text()) == resumed_source
+
         command=['/bin/sh','-c','cd source && '+shlex.quote(sys.executable)+' calculation.py']
         identifier,output=queue('experiment',{'repository':spec,'command':command,'metrics_file':'source/metrics.json'},'actual-computation')
         os.environ['FOREST_GIT_CREDENTIALS_FILE']='/operator-only/profile-path'
