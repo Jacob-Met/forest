@@ -261,8 +261,14 @@ def reconcile(scope_id):
                           scope.kind=='run_output' and entry.name=='workspace' and not directory)
                 if not excluded:
                     if entry.is_dir(follow_symlinks=False):
-                        if len(queue)<2048: queue.append([relative,''])
-                        else: scope.error='Directory queue capacity reached; inventory is incomplete'
+                        # Descend now, retaining this directory's cursor behind
+                        # its child. Breadth-first queues overflow on wide trees
+                        # and silently starve tail directories on every scan.
+                        # The depth-first stack is bounded by filesystem path
+                        # depth, not by the number of sibling directories.
+                        queue.insert(0,[relative,''])
+                        exhausted=False
+                        break
                     elif entry.is_file(follow_symlinks=False):
                         f=observe(s,scope,relative,generation)
                         if f: byte_count+=min(f.size,CONTENT_LIMIT)
