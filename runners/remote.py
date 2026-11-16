@@ -25,7 +25,13 @@ with (folder/'stdout.txt').open('ab',buffering=0) as stream:
                 state['status']='paused'; save()
             else:
                 process=subprocess.Popen(spec['argv'],cwd=spec['workdir'],env={**os.environ,**spec.get('env',{})},stdout=stream,stderr=subprocess.STDOUT)
-                state.update(command_pid=process.pid,status='running'); save(); break
+                # Keep the command's identity while the launch barrier is held.
+                # If the supervisor later dies, a surviving command can prove
+                # which process group is still ours before we signal it.
+                created=subprocess.check_output(['ps','-p',str(process.pid),'-o','lstart='],text=True).strip()
+                state.update(command_pid=process.pid,command_created=created,
+                             command_pgid=os.getpgid(process.pid),command_sid=os.getsid(process.pid),
+                             status='running'); save(); break
         time.sleep(.05)
     try:
         code=process.wait(timeout=spec.get('timeout'))
@@ -79,7 +85,7 @@ class RemoteRunner:
     def status(self, job):
         if not isinstance(job, dict) or not job.get('folder'): raise ValueError('Status requires the task handle returned by start')
         script = "import pathlib,json,subprocess; folder=pathlib.Path(" + repr(job['folder']) + "); p=folder/'state.json'; s=json.loads(p.read_text()); "
-        script += "\nif s['status'] in ('running','paused'):\n actual=subprocess.run(['ps','-p',str(s['pid']),'-o','lstart='],capture_output=True,text=True).stdout.strip()\n if actual!=s['process_created']: s.update(status='lost',error='Remote process ended without receipt')\n elif (folder/'pause.json').exists(): s['status']='paused'\n else: s['status']='running'\nprint(json.dumps(s))"
+        script += "\nif s['status'] in ('running','paused'):\n observed=subprocess.run(['ps','-p',str(s['pid']),'-o','lstart=,stat='],capture_output=True,text=True).stdout.split()\n actual=' '.join(observed[:-1]) if observed and not observed[-1].startswith('Z') else ''\n if actual!=s['process_created']: s.update(status='lost',error='Remote process ended without receipt')\n elif (folder/'pause.json').exists(): s['status']='paused'\n else: s['status']='running'\nprint(json.dumps(s))"
         return {**json.loads(self.command(['python3', '-c', script])), 'folder': job['folder']}
 
     def control(self, job, action):
@@ -99,7 +105,8 @@ s=json.loads(state.read_text())
 if s.get('task_id')!=TASK: raise ValueError('Remote task identity mismatch')
 if s['status'] in ('completed','failed','cancelled','lost'):
  print(json.dumps(s)); raise SystemExit
-actual=subprocess.run(['ps','-p',str(s['pid']),'-o','lstart='],capture_output=True,text=True).stdout.strip()
+observed=subprocess.run(['ps','-p',str(s['pid']),'-o','lstart=,stat='],capture_output=True,text=True).stdout.split()
+actual=' '.join(observed[:-1]) if observed and not observed[-1].startswith('Z') else ''
 if actual!=s.get('process_created'): raise RuntimeError('Remote executor identity was lost')
 # A pre-launch supervisor polls the durable marker without holding the lock.
 # Only a supervisor that has released its launch lock may have a live command.
@@ -165,8 +172,35 @@ if not state.exists():
 else:
  s=json.loads(state.read_text())
  if s.get('task_id')!=TASK: raise ValueError('Remote task identity mismatch')
- actual=subprocess.run(['ps','-p',str(s['pid']),'-o','lstart='],capture_output=True,text=True).stdout.strip()
- if actual==s.get('process_created'):
+ observed=subprocess.run(['ps','-p',str(s['pid']),'-o','lstart=,stat='],capture_output=True,text=True).stdout.split()
+ actual=' '.join(observed[:-1]) if observed and not observed[-1].startswith('Z') else ''
+ def surviving_command_owned():
+  # An orphaned group is not enough evidence: the PGID may have been reused.
+  # Match the exact command creation identity and its original session, not
+  # just a remembered supervisor PID. Legacy receipts remain fail-closed.
+  pid=s.get('command_pid')
+  if not isinstance(pid,int) or pid<=0 or not s.get('command_created'):
+   return False
+  if s.get('command_pgid')!=s['pid'] or s.get('command_sid')!=s['pid']:
+   return False
+  observed=subprocess.run(['ps','-p',str(pid),'-o','lstart=,stat='],capture_output=True,text=True).stdout.split()
+  if not observed or observed[-1].startswith('Z') or ' '.join(observed[:-1])!=s['command_created']:
+   return False
+  try:
+   return os.getpgid(pid)==s['pid'] and os.getsid(pid)==s['pid']
+  except ProcessLookupError:
+   return False
+ def supervisor_owned():
+  if not s.get('process_created') or actual!=s['process_created']:
+   return False
+  try:
+   return os.getpgid(s['pid'])==s['pid'] and os.getsid(s['pid'])==s['pid']
+  except ProcessLookupError:
+   return False
+ # A live supervisor or the independently recorded live command can prove the
+ # task's original session. No identity, no signal to a potentially reused PGID.
+ group_owned=(supervisor_owned() or surviving_command_owned())
+ if group_owned:
   try:
    os.killpg(s['pid'],signal.SIGTERM); os.killpg(s['pid'],signal.SIGCONT)
   except ProcessLookupError: pass
