@@ -10,6 +10,9 @@ from pathlib import Path
 DEFAULTS = {'enabled': True, 'window': 12, 'repeated_failures': 3,
             'unchanged_counterexample_repeats': 2, 'planning_without_execution': 4, 'review_every_runs': 6}
 CONTROL_KINDS = {'research_plan', 'research_route_review', 'research_analysis', 'ideas', 'suggest_paths'}
+BLOCKING_ROUTE_FINDING_KINDS = frozenset({'goal_drift', 'error_accumulation', 'repeated_failure',
+                                           'tunnel_vision', 'excessive_counterexample_checks'})
+ROUTE_FINDING_KINDS = BLOCKING_ROUTE_FINDING_KINDS | {'other'}
 PRIVATE_MATERIALS = {'stdout.txt', 'stderr.txt', 'agent_session.json', 'agent_transcript.json',
                      'task_config.json', 'container_task.json', 'remote_task.json',
                      'secrets.json', 'credentials.json', 'tokens.json'}
@@ -232,6 +235,8 @@ def validate_route_review(report, context):
     for finding in findings:
         if not isinstance(finding, dict) or not isinstance(finding.get('finding'), str) or not finding['finding'].strip():
             raise ValueError('Every route finding needs a concrete explanation')
+        if not isinstance(finding.get('kind'), str) or finding['kind'] not in ROUTE_FINDING_KINDS:
+            raise ValueError('Unknown route finding kind; use a declared route defect classification')
         for name, available in (('node_ids', allowed_nodes), ('run_ids', allowed_runs)):
             refs = finding.get(name, [])
             if not isinstance(refs, list) or any(not isinstance(x, str) or x not in available for x in refs):
@@ -243,8 +248,7 @@ def validate_route_review(report, context):
         raise ValueError('The direction needs a question and an explicit probability success event')
     result = deepcopy(report)
     result['recommendation'] = validate_idea(recommendation)
-    blocking_findings = {'goal_drift', 'error_accumulation', 'repeated_failure', 'tunnel_vision', 'excessive_counterexample_checks'}
-    detected = context['route_health']['replan_required'] or any(finding.get('kind') in blocking_findings for finding in findings)
+    detected = context['route_health']['replan_required'] or any(finding['kind'] in BLOCKING_ROUTE_FINDING_KINDS for finding in findings)
     if detected and report['decision'] == 'continue':
         raise ValueError('Detected route defects require a new direction, not continuation of the same route')
     result['evidence_label'] = 'INFERRED'
