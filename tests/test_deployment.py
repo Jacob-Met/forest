@@ -479,3 +479,45 @@ def test_real_created_container_cancellation_prevents_later_start(monkeypatch):
         assert not (workspace / 'would-have-run.txt').exists()
     finally:
         subprocess.run(['docker', 'rm', '-f', job['container_id']], capture_output=True)
+
+
+@pytest.mark.parametrize('stop_confirmed', [True, False])
+def test_container_log_timeout_does_not_abandon_running_task(tmp_path, monkeypatch, stop_confirmed):
+    """A log transport timeout must stop the actual labelled job or hold reconciliation."""
+    from runners.container import execute_container
+    from research.agents.runtime import AgentYield
+
+    workspace = tmp_path / 'workspace'; workspace.mkdir()
+    output = tmp_path / 'output'; output.mkdir()
+    job = {'container_id':'task-container-123', 'workspace':str(workspace.resolve()),
+           'task_id':'run-test', 'status':'running'}
+    (output/'container_task.json').write_text(json.dumps(job))
+    actions = []
+
+    class FakeRunner:
+        def __init__(self, config): pass
+        def status(self, received):
+            assert received['container_id'] == job['container_id']
+            return {'status':'running', 'started_at':None}
+        def output(self, received, cursor):
+            actions.append('read')
+            raise subprocess.TimeoutExpired('docker logs', 30)
+        def stop(self, received):
+            actions.append('stop')
+            if not stop_confirmed:
+                raise RuntimeError('Docker stop acknowledgement unavailable')
+            return {**received, 'status':'cancelled', 'stop_confirmed':True}
+
+    monkeypatch.setattr('runners.container.ContainerRunner', FakeRunner)
+    if stop_confirmed:
+        with pytest.raises(RuntimeError, match='log|output|timeout'):
+            execute_container({'command':['true']}, workspace, output)
+        saved = json.loads((output/'container_result.json').read_text())
+        assert saved['status'] == 'failed' and saved['cleanup']['stop_confirmed']
+    else:
+        with pytest.raises(AgentYield) as failed:
+            execute_container({'command':['true']}, workspace, output)
+        assert failed.value.status == 'waiting_input'
+        assert failed.value.wait_for['type'] == 'execution_reconciliation'
+        assert failed.value.wait_for['container_task'] == job['task_id']
+    assert actions == ['read', 'stop']

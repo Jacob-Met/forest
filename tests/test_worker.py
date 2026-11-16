@@ -100,7 +100,11 @@ elif action == "start":
     state["State"].update(Status="running", Running=True, Paused=False, StartedAt=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"))
     path.write_text(json.dumps(state))
 elif action in ("pause", "unpause", "stop"):
-    path, state = state_path(args[1])
+    if action == "stop" and (state_dir / "deny-stop").exists():
+        print("Container stop temporarily unavailable", file=sys.stderr)
+        sys.exit(1)
+    # Docker stop accepts --time GRACE before its container reference.
+    path, state = state_path(args[-1] if action == "stop" else args[1])
     if not state:
         print("Error: No such object", file=sys.stderr)
         sys.exit(1)
@@ -116,7 +120,9 @@ elif action in ("pause", "unpause", "stop"):
         state["State"].update(Status="exited", Running=False, Paused=False, ExitCode=143)
     path.write_text(json.dumps(state))
 elif action == "logs":
-    pass
+    if (state_dir / "fail-logs").exists():
+        print("Container logs unavailable", file=sys.stderr)
+        sys.exit(1)
 else:
     print("Unsupported fake Docker action: " + action, file=sys.stderr)
     sys.exit(2)
@@ -1587,3 +1593,128 @@ def test_cancel_at_real_debug_checkpoint_terminates_stopped_process(actual_worke
     wait_until(lambda: not psutil.pid_exists(stopped["pid"]) or psutil.Process(stopped["pid"]).status() == psutil.STATUS_ZOMBIE)
     assert h.run(run)["status"] == "cancelled"
     assert not (h.output(run) / "workspace" / "checkpoint_output.txt").exists()
+
+
+@pytest.mark.parametrize('stop_confirmed', [True, False])
+def test_worker_failure_waits_for_original_container_stop(tmp_path, monkeypatch, stop_confirmed):
+    """The worker cannot close a failed executor while its detached task still runs."""
+    from services.worker.main import _settle_failed_container
+
+    output = tmp_path / 'run'; output.mkdir()
+    (output / 'workspace').mkdir()
+    job = {'container_id': 'actual-container-123', 'task_id': 'run-test',
+           'workspace': str((output / 'workspace').resolve())}
+    (output / 'container_task.json').write_text(json.dumps(job))
+    checked = []
+
+    class FakeRunner:
+        def __init__(self, config): pass
+        def status(self, received):
+            assert received == job
+            checked.append('status')
+            return {'status':'running'}
+
+    def stop(config, folder, *, run_id):
+        assert run_id == 'run-test'
+        checked.append('stop')
+        if not stop_confirmed:
+            raise RuntimeError('Docker stop cannot be verified')
+        return {**job, 'status':'cancelled', 'stop_confirmed':True}
+
+    monkeypatch.setattr('services.worker.main.ContainerRunner', FakeRunner)
+    monkeypatch.setattr('services.worker.main.cancel_container', stop)
+    outcome = {'status':'failed', 'error':'Docker logs operation timed out', 'exit_code':1}
+    checked_outcome = _settle_failed_container(outcome,
+        {'execution_backend':'container'}, output, 'run-test')
+    assert checked == ['status','stop']
+    if stop_confirmed:
+        assert checked_outcome['status'] == 'failed'
+        assert checked_outcome['container_cleanup']['stop_confirmed']
+    else:
+        assert checked_outcome['status'] == 'waiting_input'
+        assert checked_outcome['wait_for']['type'] == 'execution_reconciliation'
+        assert checked_outcome['wait_for']['container_task'] == 'run-test'
+        assert checked_outcome['wait_for']['original_error'] == outcome['error']
+
+
+def test_real_executor_log_failure_holds_running_container_until_stop_acknowledged(tmp_path):
+    """Real API, worker, subprocess executor and identity-labelled detached task."""
+    h = Harness(tmp_path)
+    binary_dir, state_dir = install_fake_docker(tmp_path)
+    h.env = {**h.env, 'PATH': str(binary_dir) + os.pathsep + h.env['PATH'],
+             'FOREST_FAKE_DOCKER_STATE': str(state_dir)}
+    (state_dir / 'fail-logs').write_text('daemon log polling fails')
+    (state_dir / 'deny-stop').write_text('daemon stop fails')
+    try:
+        h.start_api(); h.start_worker()
+        _, node = h.project_node(seconds=20, timeout=40)
+        script = ("import time;from pathlib import Path;"
+                  "Path('started.txt').write_text('running');"
+                  "time.sleep(20);Path('finished.txt').write_text('should not finish')")
+        h.request('PATCH', f"/api/nodes/{node['id']}", json={'config': {
+            'kind':'command', 'command':[sys.executable,'-c',script],
+            'execution_backend':'container', 'container':{'memory':'256m'},
+            'timeout':40}})
+        run = h.launch(node);output = h.output(run)
+        blocked = wait_until(lambda: (row if (row := h.run(run))['status']=='waiting_input'
+            and row['resource'].get('execution_reconciliation_compute_hold') else None), timeout=25)
+        assert blocked['resource']['wait_for']['container_task'] == run['id']
+        assert (output/'workspace'/'started.txt').read_text() == 'running'
+        job = json.loads((output/'container_task.json').read_text())
+        state = json.loads(next(state_dir.glob('*.json')).read_text())
+        pid = state['pid']
+        assert psutil.pid_exists(pid) and state['State']['Running']
+        assert not (output/'workspace'/'finished.txt').exists()
+        # The worker cannot clear the hold until the same container can be stopped.
+        time.sleep(1)
+        still_blocked = h.run(run)
+        assert still_blocked['status']=='waiting_input'
+        assert still_blocked['resource']['execution_reconciliation_compute_hold']
+        (state_dir/'deny-stop').unlink()
+        failed = h.terminal(run, timeout=20)
+        assert failed['status']=='failed',failed
+        assert failed['resource']['container_cleanup']['stop_confirmed']
+        assert failed['resource']['container_cleanup']['container_id']==job['container_id']
+        assert not failed['resource'].get('execution_reconciliation_compute_hold')
+        stopped = json.loads(next(state_dir.glob('*.json')).read_text())
+        assert stopped['State']['Status']=='exited' and not stopped['State']['Running']
+        assert not (output/'workspace'/'finished.txt').exists()
+    finally:
+        h.cleanup()
+
+
+def test_real_worker_stops_container_even_when_failed_executor_skips_cleanup(tmp_path):
+    """Failing between executor receipt and Docker cleanup cannot abandon work."""
+    h=Harness(tmp_path)
+    binary_dir,state_dir=install_fake_docker(tmp_path)
+    h.env={**h.env, 'PATH':str(binary_dir)+os.pathsep+h.env['PATH'],
+           'FOREST_FAKE_DOCKER_STATE':str(state_dir)}
+    try:
+        h.start_api();h.start_worker()
+        _,node=h.project_node(seconds=20,timeout=40)
+        command=("import time;from pathlib import Path;"
+                 "Path('started.txt').write_text('running');"
+                 "time.sleep(20);Path('finished.txt').write_text('unexpected')")
+        h.request('PATCH',f"/api/nodes/{node['id']}",json={'config':{
+            'kind':'command','command':[sys.executable,'-c',command],
+            'execution_backend':'container','container':{'memory':'256m'},'timeout':40}})
+        run=h.launch(node)
+        active=h.running(run)
+        output=h.output(run)
+        wait_until(lambda:(output/'workspace'/'started.txt').exists())
+        job=json.loads((output/'container_task.json').read_text())
+        receipt={'status':'failed','exit_code':1,'error':'simulated executor failure before cleanup',
+                 'attempt_id':active['config']['execution_attempt']['id'],
+                 'elapsed_seconds':.1}
+        # Manufacture only the narrow crash boundary. Real WorkerLoop.monitor
+        # must stop the detached task based on its immutable ownership handle.
+        (output/'result.json').write_text(json.dumps(receipt))
+        os.kill(active['pid'],signal.SIGKILL)
+        failed=h.terminal(run,timeout=15)
+        assert failed['status']=='failed',failed
+        assert failed['resource']['container_cleanup']['container_id']==job['container_id']
+        assert failed['resource']['container_cleanup']['stop_confirmed']
+        assert not (output/'workspace'/'finished.txt').exists()
+        state=json.loads(next(state_dir.glob('*.json')).read_text())
+        assert state['State']['Status']=='exited' and not state['State']['Running']
+    finally:h.cleanup()

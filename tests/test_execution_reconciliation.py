@@ -150,3 +150,42 @@ def test_actual_worker_reconciliation_hold_enforces_original_hard_timeout(tmp_pa
         time.sleep(.3)
         assert len(h.run(run)['resource']['attempts'])==1
     finally:h.cleanup()
+
+
+def test_container_cleanup_unconfirmed_holds_then_finishes_failed_run(tmp_path, monkeypatch):
+    """An uncertain Docker stop must retain allocation and prevent new run dispatch."""
+    workspace = tmp_path / 'workspace'; workspace.mkdir()
+    output = tmp_path
+    (output / 'container_task.json').write_text(json.dumps({
+        'container_id':'task-container-123','workspace':str(workspace), 'task_id':'run-test'}))
+    wait_for = {'type':'execution_reconciliation','container_task':'run-test',
+                'original_error':'docker logs timed out', 'original_exit_code':1}
+    resource = _waiting_outcome_resource({'elapsed_seconds':1},
+        {'status':'waiting_input', 'wait_for':wait_for}, observed_at=time.time())
+    run = SimpleNamespace(id='run-test',status='waiting_input',pid=None,process_created=None,
+        kind='command', config={'execution_backend':'container', 'timeout':60},
+        resource=resource, error='Container stop unconfirmed',exit_code=None,finished_at=None)
+    calls = []
+
+    def cancel(config, path, *, run_id):
+        assert run_id == 'run-test'
+        calls.append(run_id)
+        if len(calls) == 1:
+            raise OSError('Docker inspect unavailable')
+        return {'container_id':'task-container-123', 'status':'cancelled', 'stop_confirmed':True}
+
+    monkeypatch.setattr('runners.container.cancel_container', cancel)
+    _reconcile_execution_hold(run, output)
+    assert run.status == 'waiting_input'
+    assert run.resource['execution_reconciliation_compute_hold']
+    assert 'Docker inspect unavailable' in run.resource['container_cleanup_error']
+    assert run.resource['container_cleanup_retry_at'] > time.time()
+    _reconcile_execution_hold(run, output)
+    assert calls == ['run-test']  # No repeated Docker call every worker tick.
+    run.resource['container_cleanup_retry_at'] = 0
+    _reconcile_execution_hold(run, output)
+    assert run.status == 'failed'
+    assert run.exit_code == 1 and run.error == 'docker logs timed out'
+    assert not run.resource.get('execution_reconciliation_compute_hold')
+    assert run.resource['container_cleanup']['stop_confirmed']
+    assert calls == ['run-test', 'run-test']
