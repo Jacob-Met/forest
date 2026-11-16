@@ -1289,6 +1289,85 @@ def case_visitors_shares_and_origin_denial(client, app):
     assert client.get("/api/shares/" + share["token"]).status_code == 404
 
 
+def case_retired_provider_blocks_cached_client_requests(client, app):
+    """A worker holding the old key cannot send a new request after retirement."""
+    from functools import partial
+    from threading import Event
+    from unittest.mock import patch
+    import httpx
+    from services.api.common import read_secret
+    from services.api.db import Session, Provider, ModelRequest, asdict
+    from research.agents.provider import ModelClient
+    from research.agents.budget import make_request_guard, BudgetExceeded
+    import research.agents.provider as provider_module
+
+    pricing = {"input_per_million": 1, "output_per_million": 1, "currency": "USD"}
+    created = ok(client.post("/api/providers", json={
+        "name": "Retirement guard dummy", "kind": "openai",
+        "base_url": "http://127.0.0.1:7777/v1", "model": "dummy-model",
+        "allow_paid": True, "config": {"budget_usd": 2, "pricing": pricing, "max_retries": 0},
+        "api_key": "RETIRED-DUMMY-KEY",
+    }))
+    with Session() as session:
+        stored = session.get(Provider, created["id"])
+        snapshot = asdict(stored, secrets=True)
+        old_key = read_secret(stored.credential_ref)
+    cached_client = ModelClient(snapshot, old_key, allow_paid=True,
+                                request_guard=make_request_guard(snapshot))
+    requests = []
+    inflight_started, release_inflight = Event(), Event()
+    hold_next = False
+
+    def reply(request):
+        requests.append(request)
+        if hold_next:
+            inflight_started.set()
+            assert release_inflight.wait(timeout=10)
+        assert request.headers["Authorization"] == "Bearer RETIRED-DUMMY-KEY"
+        return httpx.Response(200, json={
+            "id": "dummy-response", "model": "dummy-model",
+            "choices": [{"finish_reason": "stop", "message": {"content": '{"ok": true}'}}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 2},
+        })
+
+    original_client = provider_module.httpx.Client
+    with patch.object(provider_module.httpx, "Client",
+                      partial(original_client, transport=httpx.MockTransport(reply))):
+        first = cached_client.complete([{"role": "user", "content": "Before retirement"}],
+                                       max_output_tokens=24)
+    assert first["status"] == "completed" and len(requests) == 1
+
+    # A request already reserved before retirement can finish and account
+    # for actual usage, but any request authorized afterward must be blocked.
+    hold_next = True
+    with patch.object(provider_module.httpx, "Client",
+                      partial(original_client, transport=httpx.MockTransport(reply))):
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            outstanding = pool.submit(cached_client.complete,
+                                      [{"role": "user", "content": "Already in flight"}],
+                                      max_output_tokens=24)
+            assert inflight_started.wait(timeout=8)
+            try:
+                retired = ok(client.post(f"/api/providers/{created['id']}/retire", json={}))
+            finally:
+                release_inflight.set()
+            assert outstanding.result(timeout=10)["status"] == "completed"
+
+    assert retired["provider"]["status"] == "retired"
+    with Session() as session:
+        assert session.get(Provider, created["id"]).credential_ref is None
+
+    with patch.object(provider_module.httpx, "Client",
+                      partial(original_client, transport=httpx.MockTransport(reply))):
+        with pytest.raises(BudgetExceeded, match="retired"):
+            cached_client.complete([{"role": "user", "content": "After retirement"}],
+                                   max_output_tokens=24)
+    assert len(requests) == 2
+    with Session() as session:
+        entries = list(session.query(ModelRequest).filter(ModelRequest.provider_id == created["id"]))
+    assert len(entries) == 2 and all(entry.status == "settled" for entry in entries)
+
+
 def case_real_provider_failure_and_local_host(client, app):
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
