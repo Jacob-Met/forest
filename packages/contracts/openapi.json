@@ -17290,7 +17290,7 @@
     },
     "/api/projects/{ident}/download": {
       "get": {
-        "description": "FileResponse with inline Content-Disposition and the file's basename. Content type depends on its filename; use the response bytes/blob, not JSON. No text-size limit is applied here.",
+        "description": "Return exact file bytes with a sandboxed, non-cacheable response. Passive PDF and raster-image types render inline; other types, including active HTML/SVG and text documents, download as attachments so project output cannot run scripts on the application origin. Content type and filename come from the file; the response is not JSON. No text-size limit applies.",
         "operationId": "download_file_api_projects__ident__download_get",
         "parameters": [
           {

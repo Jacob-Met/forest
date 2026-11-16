@@ -537,7 +537,8 @@ def rename_file(ident:str,body:dict=Body(...)):
 def download_file(ident:str,path:str):
     p=safe_path(validate_project(ident),path,True)
     if not p.is_file(): error('NOT_FILE','Choose a file')
-    return FileResponse(p,filename=p.name,content_disposition_type='inline')
+    disposition, headers = artifact_download_policy(p.name)
+    return FileResponse(p, filename=p.name, content_disposition_type=disposition, headers=headers)
 @router.post('/api/projects/{ident}/upload')
 async def upload(ident:str,file:UploadFile=File(...),directory:str='uploads',overwrite:bool=True):
     root=validate_project(ident); p=safe_path(root,directory+'/'+Path(file.filename or 'upload').name)
