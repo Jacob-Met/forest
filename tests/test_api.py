@@ -2418,6 +2418,65 @@ def case_large_integer_csv_cells_survive_data_rows(client, app):
     assert path.read_bytes() == content
 
 
+def case_table_rows_streams_complete_csv_and_parquet(client, app):
+    from unittest.mock import patch
+    import pandas as pd
+    from services.api.db import Session, TaskRun
+
+    project = create(client)
+    node = add_node(client, project, config={
+        'kind': 'command', 'command': [sys.executable, '-c', 'pass'],
+    })
+    run = ok(client.post(f"/api/nodes/{node['id']}/run", json={
+        'request_id': 'streamed-data-row-regression',
+    }))
+    directory = Path(os.environ['FOREST_DATA_DIR']) / 'projects' / project['id'] / run['output_path']
+    directory.mkdir(parents=True, exist_ok=True)
+    csv = directory / 'table.csv'
+    with csv.open('w') as stream:
+        stream.write('code,score,description,passed\n')
+        for number in range(20_000):
+            passed = '' if number % 97 == 0 else ('True' if number % 2 else 'False')
+            stream.write(f'{number:06d},{number % 103},{ "needle" if number == 17_345 else "other" },{passed}\n')
+    parquet = directory / 'table.parquet'
+    pd.DataFrame({'value': range(20_000), 'description': ['needle' if x == 17_345 else 'other' for x in range(20_000)]}).to_parquet(parquet, row_group_size=512)
+    with Session.begin() as session:
+        session.get(TaskRun, run['id']).status = 'completed'
+    original_csv = pd.read_csv
+    def guarded_csv(*args, **kwargs):
+        assert kwargs.get('chunksize') or kwargs.get('nrows') is not None, 'Full-file pandas CSV materialization'
+        return original_csv(*args, **kwargs)
+    def guarded_parquet(*args, **kwargs):
+        raise AssertionError('Full-file pandas Parquet materialization')
+    root = Path(os.environ['FOREST_DATA_DIR']) / 'projects' / project['id']
+    def get_rows(file, **params):
+        return ok(client.get(f"/api/data/{run['id']}/rows", params={
+            'path': file.relative_to(root).as_posix(), **params,
+        }))
+    with patch.object(pd, 'read_csv', guarded_csv), patch.object(pd, 'read_parquet', guarded_parquet):
+        first = get_rows(csv, offset=0, limit=2)
+        assert first['total'] == 20_000 and first['rows'][0]['code'] == '000000', first
+        assert first['rows'][0]['passed'] is None and first['rows'][1]['passed'] is True, first
+        last = get_rows(csv, offset=19_999, limit=3)
+        assert last['total'] == 20_000 and last['rows'][0]['code'] == '019999', last
+        filtered = get_rows(csv, filter='needle', limit=5)
+        assert filtered['total'] == 1 and filtered['rows'][0]['code'] == '017345', filtered
+        sorted_rows = get_rows(csv, sort='score', descending='true', limit=2)
+        assert sorted_rows['total'] == 20_000 and all(row['score'] == 102 for row in sorted_rows['rows']), sorted_rows
+        # A deep sorted page must remain correct on the disk-backed path.
+        deep = get_rows(csv, sort='score', descending='true', offset=9000, limit=2)
+        expected = sorted((i % 103 for i in range(20_000)), reverse=True)[9000:9002]
+        assert deep['total'] == 20_000 and [row['score'] for row in deep['rows']] == expected, deep
+        page = get_rows(parquet, offset=19_998, limit=10)
+        assert page['total'] == 20_000 and [row['value'] for row in page['rows']] == [19_998, 19_999], page
+        matching = get_rows(parquet, filter='needle')
+        assert matching['total'] == 1 and matching['rows'][0]['value'] == 17_345, matching
+        high = get_rows(parquet, sort='value', descending='true', limit=2)
+        assert [row['value'] for row in high['rows']] == [19_999, 19_998], high
+        deep_parquet = get_rows(parquet, sort='value', descending='true', offset=9000, limit=2)
+        assert [row['value'] for row in deep_parquet['rows']] == [10_999, 10_998], deep_parquet
+
+
 def case_raw_data_float_precision(client, app):
     import math
     import pandas as pd
