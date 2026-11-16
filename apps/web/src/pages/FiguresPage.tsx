@@ -7,6 +7,7 @@ import {
   Save,
   Send,
   X,
+  ShieldAlert,
 } from "lucide-react";
 import { api, download, uid, parseJson } from "../api";
 import type { Json, RecordItem, Run } from "../api";
@@ -89,6 +90,17 @@ export function FiguresPage() {
               </button>
             ))}
           </div>
+          {figure?.data.code_origin === "imported_untrusted" && (
+            <div className="figure-import-warning" role="status">
+              <ShieldAlert size={17} />
+              <span>
+                {t(
+                  "导入的 Python 代码不会执行，当前使用内置绘图器。检查并修改代码后才能运行自定义版本。",
+                  "Imported Python is disabled. Rendering uses the built-in renderer until you review and edit the code.",
+                )}
+              </span>
+            </div>
+          )}
           {figure && (
             <FigureEditor
               key={figure.id}
@@ -518,14 +530,6 @@ function FigureEditor({
             </div>
           )}
         </div>
-        {figure.data.code_origin === "imported_untrusted" && (
-          <p className="muted" role="status">
-            {t(
-              "导入的 Python 代码不会执行。绘图使用内置渲染器；如需运行自定义代码，请先检查并修改它。",
-              "Imported Python is disabled. The built-in renderer is used; review and edit the code to enable custom execution.",
-            )}
-          </p>
-        )}
         <div className="inline-actions">
           <Button
             onClick={() => {
