@@ -1,6 +1,7 @@
 """Persistent research sessions and actual, separately supervised tool processes."""
 from __future__ import annotations
 import codecs
+from contextlib import contextmanager
 from copy import deepcopy
 import json
 import shlex
@@ -53,6 +54,37 @@ class ToolRuntime:
         # Local execution remains an explicit trusted-owner choice.
         process_config.setdefault('execution_backend', 'bubblewrap')
         self.processes = process_manager(workspace, process_config)
+
+    @contextmanager
+    def _editable_file_guard(self, project_id, path):
+        """Keep Agent tool writes behind the same owner publication boundary.
+
+        Once an owner has published a file (including an import, rename or
+        deletion), tool writes must not reuse an earlier Agent file intent.
+        Otherwise a replayed chunk can truncate the owner's newer bytes and
+        still leave the owner's FileRevision token and origin unchanged.
+        """
+        from services.api.files import file_publication_lock
+        root = project_dir(project_id).resolve()
+        try:
+            relative = str(path.relative_to(root))
+        except ValueError:
+            # Local standalone Agent workspaces cannot be published by the
+            # owner project-file API; there is no shared path to serialize.
+            yield
+            return
+        with file_publication_lock(project_id, relative):
+            with Session() as session:
+                owner_revision = session.scalar(select(FileRevision).where(
+                    FileRevision.project_id == project_id,
+                    FileRevision.path == relative,
+                ))
+                if owner_revision is not None:
+                    raise ValueError(
+                        'Owner-managed file is protected; write Agent output to a '
+                        'different path instead of replacing the owner edit'
+                    )
+            yield
 
     def execute(self, name, args, action_id=None, *, observed_revision=None):
         action_id = action_id or uid()
@@ -192,13 +224,16 @@ class ToolRuntime:
             return result
         if name == 'write_file':
             p = safe_path(self.workspace, args['path'])
-            p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(args['content'])
-            return {'path': str(p.relative_to(self.workspace)), 'bytes': p.stat().st_size, 'exit_code': 0}
+            with self._editable_file_guard(pid, p):
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text(args['content'])
+                size = p.stat().st_size
+            return {'path': str(p.relative_to(self.workspace)), 'bytes': size, 'exit_code': 0}
         if name == 'write_file_chunk':
             p = safe_path(self.workspace, args['path'])
-            return {'path': str(p.relative_to(self.workspace)),
-                    **write_file_chunk(p, args['content'], args['offset'], replay=replay)}
+            with self._editable_file_guard(pid, p):
+                result = write_file_chunk(p, args['content'], args['offset'], replay=replay)
+            return {'path': str(p.relative_to(self.workspace)), **result}
         if name == 'list_files':
             files = sorted(str(p.relative_to(self.workspace)) for p in self.workspace.rglob('*') if p.is_file() and not p.is_symlink() and not any(part.startswith('.forest-') for part in p.relative_to(self.workspace).parts))
             offset, limit = int(args.get('offset', 0)), max(1, min(1000, int(args.get('limit', 200))))
@@ -217,8 +252,9 @@ class ToolRuntime:
                         'reattached': True}
             if name == 'python':
                 script = safe_path(self.workspace, args.get('path', 'agent_analysis.py'))
-                script.parent.mkdir(parents=True, exist_ok=True)
-                script.write_text(args['code'])
+                with self._editable_file_guard(pid, script):
+                    script.parent.mkdir(parents=True, exist_ok=True)
+                    script.write_text(args['code'])
                 command = [sys.executable, str(script)]
             else:
                 command = args.get('command') or args.get('argv')
