@@ -1289,6 +1289,52 @@ def case_visitors_shares_and_origin_denial(client, app):
     assert client.get("/api/shares/" + share["token"]).status_code == 404
 
 
+def case_provider_retirement_advances_graph_revisions(client, app):
+    """Pre-retirement project and node snapshots cannot restore a retired key."""
+    def provider(name):
+        return ok(client.post("/api/providers", json={
+            "name": name, "kind": "openai", "base_url": "http://127.0.0.1:12345/v1",
+            "model": "dummy", "api_key": "DUMMY-" + name,
+        }))
+
+    old, replacement = provider("A"), provider("B")
+    first = ok(client.post("/api/projects", json={
+        "name": "Project provider", "config": {"provider_id": old["id"]},
+    }))
+    first_nodes = [add_node(client, first, config={"provider_id": old["id"]})
+                   for _ in range(2)]
+    second = ok(client.post("/api/projects", json={"name": "Node-only provider"}))
+    second_node = add_node(client, second, config={"provider_id": old["id"]})
+    before = {ident: ok(client.get(f"/api/projects/{ident}"))["revision"]
+              for ident in (first["id"], second["id"])}
+    node_revisions = {node["id"]: node["revision"]
+                      for node in first_nodes + [second_node]}
+
+    result = ok(client.post(f"/api/providers/{old['id']}/retire", json={
+        "replacement_provider_id": replacement["id"],
+    }))
+    assert result["updated_reference_count"] >= 4
+    for ident in (first["id"], second["id"]):
+        after = ok(client.get(f"/api/projects/{ident}"))
+        assert after["revision"] == before[ident] + 1
+        assert ok(client.get(f"/api/projects/{ident}/graph"))["revision"] == after["revision"]
+    assert ok(client.get(f"/api/projects/{first['id']}"))["config"]["provider_id"] == replacement["id"]
+    for node in first_nodes + [second_node]:
+        refreshed = ok(client.get(f"/api/nodes/{node['id']}"))
+        assert refreshed["config"]["provider_id"] == replacement["id"]
+        assert refreshed["revision"] == node_revisions[node["id"]] + 1
+
+    stale = client.patch(f"/api/projects/{first['id']}", json={
+        "expected_revision": before[first["id"]], "config": {"provider_id": old["id"]},
+    })
+    assert ok(stale, 409)["detail"]["code"] == "REVISION_CONFLICT"
+    stale_node = client.patch(f"/api/nodes/{first_nodes[0]['id']}", json={
+        "expected_revision": before[first["id"]], "config": {"provider_id": old["id"]},
+    })
+    assert stale_node.status_code == 409
+    assert ok(client.get(f"/api/projects/{first['id']}"))["config"]["provider_id"] == replacement["id"]
+
+
 def case_real_provider_failure_and_local_host(client, app):
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))

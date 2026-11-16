@@ -588,6 +588,7 @@ def provider_retire(ident:str,body:dict=Body(default={} )):
     replacement_id=body.get('replacement_provider_id')
     credential_ref=None
     with Session.begin() as s:
+        begin_sqlite_write(s)
         p=get(s,Provider,ident,for_update=True)
         replacement=None
         if replacement_id:
@@ -595,18 +596,27 @@ def provider_retire(ident:str,body:dict=Body(default={} )):
             replacement=get(s,Provider,replacement_id)
             if replacement.status=='retired': error('INVALID_REPLACEMENT','Replacement provider must be active',422)
         snapshot=provider_references(s,ident)
-        for project in s.scalars(select(Project)):
+        projects={project.id:project for project in s.scalars(select(Project).with_for_update())}
+        changed_projects=set()
+        for project in projects.values():
             config=dict(project.config or {})
             if config.get('provider_id')==ident:
                 if replacement: config['provider_id']=replacement.id
                 else: config.pop('provider_id',None)
                 project.config=config
+                changed_projects.add(project.id)
         for node in s.scalars(select(Node)):
             config=dict(node.config or {})
             if config.get('provider_id')==ident:
                 if replacement: config['provider_id']=replacement.id
                 else: config.pop('provider_id',None)
                 node.config=config
+                node.revision+=1
+                changed_projects.add(node.project_id)
+        for project_id in sorted(changed_projects):
+            project=projects[project_id]
+            project.revision+=1
+            emit(s,project_id,'project_changed',{'revision':project.revision})
         for agent in s.scalars(select(Agent).where(Agent.provider_id==ident)):
             agent.provider_id=replacement.id if replacement else None
         from services.observation.models import ReporterPolicy
