@@ -1,7 +1,7 @@
 """Shared API spending reservations. Ordinary editable usage records, no content IDs."""
 from decimal import Decimal, InvalidOperation, ROUND_CEILING
 import math
-from sqlalchemy import select, text, update
+from sqlalchemy import and_, case, func, or_, select, text, update
 from services.api.db import Session, Provider, ModelRequest, Project, TaskRun
 
 
@@ -84,12 +84,33 @@ def totals(rows):
     return estimated, reserved
 
 
-def cost_summary(rows, limit=None, *, unpriced=False):
-    """Expose incomplete USD accounting without changing reservation guards."""
-    estimated, reserved = totals(rows)
-    unknown = sum(r.status != 'rejected' and r.estimated_microusd is None and
-                  (r.details.get('cost_source') in ('unpriced_local_provider', 'unknown') or
-                   r.status in ('completed', 'settled')) for r in rows)
+
+def ledger_stats(session, *filters, include_summary=False):
+    """Aggregate settled charges and live reservations in SQL, under the caller's lock."""
+    pending = ModelRequest.status.in_(('reserved', 'uncertain'))
+    columns = (
+        func.coalesce(func.sum(ModelRequest.estimated_microusd), 0),
+        func.coalesce(func.sum(case((pending, ModelRequest.reserved_microusd), else_=0)), 0),
+    )
+    if include_summary:
+        source = ModelRequest.details['cost_source'].as_string()
+        unknown = and_(
+            ModelRequest.status != 'rejected',
+            ModelRequest.estimated_microusd.is_(None),
+            or_(ModelRequest.status.in_(('completed', 'settled')),
+                source.in_(('unpriced_local_provider', 'unknown'))),
+        )
+        columns += (
+            func.count(ModelRequest.id),
+            func.coalesce(func.sum(case((ModelRequest.status == 'uncertain', 1), else_=0)), 0),
+            func.coalesce(func.sum(case((unknown, 1), else_=0)), 0),
+            func.coalesce(func.sum(case((source == 'unpriced_local_provider', 1), else_=0)), 0),
+        )
+    return tuple(int(value or 0) for value in session.execute(select(*columns).where(*filters)).one())
+
+
+def cost_summary_amounts(estimated, reserved, unknown, has_unpriced_local, limit=None,
+                         *, unpriced=False):
     incomplete = bool(unknown or unpriced)
     return {'estimated_cost_usd': None if incomplete else estimated / 1000000,
             'known_cost_usd': estimated / 1000000, 'unknown_cost_requests': unknown,
@@ -97,9 +118,18 @@ def cost_summary(rows, limit=None, *, unpriced=False):
             'remaining_usd': max(0, micro(limit)-estimated-reserved) / 1000000
                 if limit is not None and not incomplete else None,
             'cost_source': ('mixed_known_and_unknown' if estimated else
-                            'unpriced_local_provider' if unpriced or any(
-                                r.details.get('cost_source') == 'unpriced_local_provider' for r in rows)
+                            'unpriced_local_provider' if unpriced or has_unpriced_local
                             else 'unknown') if incomplete else 'configured_rates_estimate'}
+
+def cost_summary(rows, limit=None, *, unpriced=False):
+    """Expose incomplete USD accounting without changing reservation guards."""
+    estimated, reserved = totals(rows)
+    unknown = sum(r.status != 'rejected' and r.estimated_microusd is None and
+                  (r.details.get('cost_source') in ('unpriced_local_provider', 'unknown') or
+                   r.status in ('completed', 'settled')) for r in rows)
+    return cost_summary_amounts(estimated, reserved, unknown, any(
+        r.details.get('cost_source') == 'unpriced_local_provider' for r in rows),
+        limit, unpriced=unpriced)
 
 
 def interrupt_run_reservations(run_id, *, session=None):
@@ -126,16 +156,20 @@ def usage_summary(provider_id):
         provider = s.get(Provider, provider_id)
         if provider is None:
             raise ValueError('Unknown provider')
-        rows = list(s.scalars(select(ModelRequest).where(ModelRequest.provider_id == provider_id).order_by(ModelRequest.created_at.desc())))
+        estimated, reserved, count, uncertain, unknown, unpriced_local = ledger_stats(
+            s, ModelRequest.provider_id == provider_id, include_summary=True)
+        rows = list(s.scalars(select(ModelRequest).where(ModelRequest.provider_id == provider_id)
+                              .order_by(ModelRequest.created_at.desc(), ModelRequest.id.desc()).limit(100)))
         limit = provider.config.get('budget_usd')
         return {'provider_id':provider_id, 'limit_usd':limit,
-                **cost_summary(rows, limit, unpriced=provider.kind=='codex_cli'), 'request_count':len(rows),
-                'uncertain_requests':sum(r.status == 'uncertain' for r in rows),
+                **cost_summary_amounts(estimated, reserved, unknown, unpriced_local, limit,
+                                       unpriced=provider.kind=='codex_cli'),
+                'request_count':count, 'uncertain_requests':uncertain,
                 'requests':[{'id':r.id,'run_id':r.run_id,'project_id':r.project_id,'model':r.model,
                     'api':r.details.get('api', 'text'), 'purpose':r.details.get('purpose','research'), 'report_job_id':r.details.get('report_job_id'),
                     'status':r.status,'estimated_cost_usd':r.estimated_microusd/1000000 if r.estimated_microusd is not None else None,
                     'reserved_usd':r.reserved_microusd/1000000 if r.status in ('reserved','uncertain') else 0,
-                    'request_id':r.request_id,'usage':r.details.get('usage'), 'created_at':r.created_at} for r in rows[:100]]}
+                    'request_id':r.request_id,'usage':r.details.get('usage'), 'created_at':r.created_at} for r in rows]}
 
 
 def make_request_guard(provider):
@@ -190,8 +224,7 @@ def make_request_guard(provider):
                     reservation = int((input_bound*inp+max_output*out).to_integral_value(rounding=ROUND_CEILING))
                     details = {'api': api, 'pricing': pricing, 'input_token_upper_bound': input_bound,
                                'max_output_tokens': max_output, 'attempt': event.get('attempt')}
-                rows = list(s.scalars(select(ModelRequest).where(ModelRequest.provider_id == ident)))
-                used, reserved = totals(rows)
+                used, reserved = ledger_stats(s, ModelRequest.provider_id == ident)
                 if limit is not None and used + reserved + reservation > micro(limit):
                     raise BudgetExceeded(f'Provider API budget cannot reserve this request (${reservation/1000000:.4f}); remaining ${max(0,micro(limit)-used-reserved)/1000000:.4f}')
                 if context.get('project_id'):
@@ -202,8 +235,7 @@ def make_request_guard(provider):
                         raise BudgetExceeded('Paid API calls are disabled for this project')
                     project_limit = project.budget.get('cost_usd') if project else None
                     if project_limit is not None:
-                        project_rows = list(s.scalars(select(ModelRequest).where(ModelRequest.project_id == project.id)))
-                        pu, pr = totals(project_rows)
+                        pu, pr = ledger_stats(s, ModelRequest.project_id == project.id)
                         if pu + pr + reservation > micro(project_limit):
                             raise BudgetExceeded('Project API spending limit reached')
                 if context.get('report_job_id'):
@@ -223,10 +255,11 @@ def make_request_guard(provider):
                             or report_policy.settings.get('provider_id') != ident):
                         raise BudgetExceeded('Reporting authorization or lease changed')
                     limits = ReporterSettings.model_validate(report_policy.settings)
-                    report_rows = list(s.scalars(select(ModelRequest).where(ModelRequest.project_id == project.id, ModelRequest.run_id.is_(None))))
-                    report_rows = [r for r in report_rows if r.details.get('purpose') == 'reporter']
-                    ru, rr = totals(report_rows)
-                    if len(report_rows) >= limits.max_requests or ru + rr + reservation > micro(limits.cap_usd):
+                    ru, rr, report_count, _, _, _ = ledger_stats(
+                        s, ModelRequest.project_id == project.id, ModelRequest.run_id.is_(None),
+                        ModelRequest.details['purpose'].as_string() == 'reporter',
+                        include_summary=True)
+                    if report_count >= limits.max_requests or ru + rr + reservation > micro(limits.cap_usd):
                         raise BudgetExceeded('Reporting sub-budget reached')
                     details = {**details, 'purpose': 'reporter', 'report_job_id': job.id, 'report_policy_version': report_policy.version}
                     report_policy.last_dispatch = time.time()
@@ -238,8 +271,7 @@ def make_request_guard(provider):
                         raise BudgetExceeded('The request run is no longer executing')
                     run_limit = (run.config.get('agent_budget') or {}).get('cost')
                     if run_limit is not None:
-                        run_rows = list(s.scalars(select(ModelRequest).where(ModelRequest.run_id == run.id)))
-                        ru, rr = totals(run_rows)
+                        ru, rr = ledger_stats(s, ModelRequest.run_id == run.id)
                         if ru + rr + reservation > micro(run_limit):
                             raise BudgetExceeded('Agent API spending limit cannot reserve this request; settled and uncertain requests remain charged against the same run')
                 record = ModelRequest(provider_id=ident, project_id=context.get('project_id'),run_id=context.get('run_id'),
