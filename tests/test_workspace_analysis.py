@@ -724,6 +724,47 @@ def case_request_replay_precedes_revision_guard_and_changed_intent_conflicts(cli
         assert [row.id for row in rows] == [run['id']]
 
 
+def case_researcher_provider_change_cannot_submit_old_saved_draft(client, app):
+    """A stale browser draft cannot silently route research to an earlier model."""
+    from services.api.db import Session, Agent, TaskRun
+    from sqlalchemy import select
+
+    project = create(client, "Saved analysis provider selection")
+    provider_a = provider(client)
+    provider_b = provider(client)
+    with Session.begin() as session:
+        research_agent = session.scalar(select(Agent).where(Agent.role == "Researcher"))
+        if research_agent is None:
+            research_agent = Agent(name="Researcher", role="Researcher")
+            session.add(research_agent)
+        research_agent.provider_id = provider_a["id"]
+        session.flush()
+        agent_id = research_agent.id
+    endpoint_url = endpoint(project)
+    reviewed = ok(client.get(endpoint_url + '/context'))
+    assert reviewed['provider']['id'] == provider_a['id']
+    old = request_body(client, project, provider_id=provider_a['id'],
+                       expected_provider_id=provider_a['id'],
+                       expected_fingerprint=reviewed['snapshot']['fingerprint'])
+    # This is a settings change, not a graph/project revision.
+    with Session.begin() as session:
+        session.get(Agent, agent_id).provider_id = provider_b['id']
+    fresh = ok(client.get(endpoint_url + '/context'))
+    assert fresh['provider']['id'] == provider_b['id']
+    assert fresh['snapshot'] == reviewed['snapshot']
+    denied = client.post(endpoint_url, json=old)
+    assert denied.status_code == 409, denied.text
+    assert denied.json()['detail']['code'] == 'PROVIDER_SELECTION_CHANGED'
+    assert ok(client.get(endpoint_url)) == {'runs': []}
+    accepted = ok(client.post(endpoint_url, json={
+        **old, 'request_id': str(uuid4()), 'provider_id': provider_b['id'],
+        'expected_provider_id': provider_b['id']}))
+    assert accepted['config']['provider_selection']['provider_id'] == provider_b['id']
+    with Session() as session:
+        records = list(session.scalars(select(TaskRun).where(TaskRun.project_id == project['id'])))
+        assert len(records) == 1
+
+
 def case_scope_rejects_foreign_entities_and_branch_analysis_has_no_scheduler_binding(client, app):
     from services.api.db import Session, TaskRun
     from sqlalchemy import select
