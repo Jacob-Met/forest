@@ -52,6 +52,10 @@ jobs:
           chmod +x "$install_dir/tectonic"
           echo "$install_dir" >> "$GITHUB_PATH"
           "$install_dir/tectonic" --version
+          # Only fixed, trusted setup sources fetch TeX packages. User
+          # manuscripts compile offline behind Bubblewrap.
+          export PATH="$install_dir:$PATH"
+          python scripts/prime_tectonic_cache.py
       - run: python -m pip install -r requirements.lock.txt
       - run: python -m pip install --no-deps -e .
       - run: forest --help

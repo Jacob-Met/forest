@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import io
+import os
 from pathlib import Path
 import re
 import shutil
@@ -88,16 +89,81 @@ def apply_template(directory, template="article"):
     return info
 
 
+def _sandboxed_tex_command(command, directory):
+    r"""Give TeX the paper bundle, public TeX runtime, and no host project files.
+
+    TeX's own -no-shell-escape / --untrusted modes do not restrict \input or
+    \openin. Only a separate mount namespace makes those reads impossible.
+    """
+    bwrap = shutil.which("bwrap")
+    if not bwrap:
+        return None
+
+    sandbox = [bwrap, "--unshare-all", "--die-with-parent", "--new-session",
+               "--clearenv", "--setenv", "HOME", "/tmp",
+               "--setenv", "XDG_CACHE_HOME", "/tex-cache",
+               "--setenv", "TEXMFVAR", "/tmp/texmf-var",
+               "--setenv", "TEXMFCONFIG", "/tmp/texmf-config",
+               "--setenv", "PATH", "/usr/local/bin:/usr/bin:/bin",
+               "--setenv", "LANG", "C.UTF-8",
+               "--dir", "/usr", "--dir", "/usr/share"]
+
+    # Mount the public compiler runtime, not the rest of /usr (which can hold
+    # private application files under /usr/local).
+    for system_path in ("/usr/bin", "/usr/lib", "/usr/lib64",
+                        "/usr/share/texlive", "/usr/share/texmf",
+                        "/usr/share/texmf-dist", "/usr/share/tex-common",
+                        "/usr/share/fonts"):
+        if Path(system_path).exists():
+            sandbox += ["--ro-bind", system_path, system_path]
+
+    # On merged-/usr systems these are symlinks, not separate mounts.
+    for name in ("bin", "sbin", "lib", "lib64"):
+        system_path = Path("/") / name
+        if system_path.is_symlink():
+            sandbox += ["--symlink", str(system_path.readlink()), str(system_path)]
+        elif system_path.exists():
+            sandbox += ["--ro-bind", str(system_path), str(system_path)]
+
+    # Only public TeX configuration and installed font maps are visible; never
+    # bind /etc, /home or the project's parent into the compiler namespace.
+    for system_path in ("/etc/texmf", "/etc/fonts", "/etc/papersize",
+                        "/var/lib/texmf", "/etc/ssl/certs",
+                        "/usr/share/ca-certificates"):
+        if Path(system_path).exists():
+            sandbox += ["--ro-bind", system_path, system_path]
+
+    # A Tectonic bundle already fetched by the trusted operator may be read
+    # offline. Never give the compiler the rest of the user's cache or home.
+    tectonic_cache = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "tectonic"
+    if tectonic_cache.is_dir():
+        sandbox += ["--dir", "/tex-cache", "--ro-bind",
+                    str(tectonic_cache), "/tex-cache/tectonic"]
+
+    # Mount the resolved binary under the invoked name. This preserves TeX's
+    # argv[0]-selected format (pdflatex vs pdftex) while avoiding host symlinks
+    # through /etc/alternatives and exposing no unrelated executable directory.
+    executable = Path(command[0]).resolve()
+    inside_executable = "/tex-bin/" + Path(command[0]).name
+    sandbox += ["--dir", "/tex-bin", "--ro-bind",
+                str(executable), inside_executable]
+
+    sandbox += ["--tmpfs", "/tmp", "--proc", "/proc", "--dev", "/dev",
+                "--bind", str(directory), "/paper", "--chdir", "/paper",
+                inside_executable]
+    return sandbox + command[1:]
+
+
 def compile_paper(directory, source_name="paper.tex", timeout=180, *, repair_layout=False, _layout_attempt=1):
     from research.paper.layout import compile_preflight
     directory = Path(directory).resolve()
     source = (directory / source_name).resolve()
-    if source.parent != directory or source.suffix != ".tex" or not source.is_file():
+    if source.parent != directory or source.suffix != ".tex" or source.name.startswith("-") or not source.is_file():
         raise ValueError("Compile a .tex source in the paper directory")
     tectonic, pdflatex = shutil.which("tectonic"), shutil.which("pdflatex")
     logs = []
     if tectonic:
-        commands = [[tectonic, "--keep-logs", "--keep-intermediates", "--outdir", str(directory), source.name]]
+        commands = [[tectonic, "--untrusted", "--only-cached", "--keep-logs", "--keep-intermediates", "--outdir", "/paper", source.name]]
     elif pdflatex:
         commands = [[pdflatex, "-no-shell-escape", "-interaction=nonstopmode", "-file-line-error", source.name]]
         if "\\bibliography" in source.read_text():
@@ -112,13 +178,24 @@ def compile_paper(directory, source_name="paper.tex", timeout=180, *, repair_lay
         report = compile_preflight(directory, source_name, False, '', actual_compilation=False)
         return {"status": "unavailable", "pdf_path": None, "log": "No tectonic or pdflatex executable found", "errors": [{"message": "Install tectonic or a TeX distribution"}],
                 "preflight": report, "preflight_path": str(directory / 'layout_preflight.json')}
-    # Remove an old PDF so a failed compile cannot be mistaken for new output.
+    # Remove an old PDF so an unavailable sandbox cannot leave stale success.
     pdf = directory / (source.stem + ".pdf")
     pdf.unlink(missing_ok=True)
+    sandboxed_commands = [_sandboxed_tex_command(command, directory) for command in commands]
+    if any(command is None for command in sandboxed_commands):
+        report = compile_preflight(directory, source_name, False, "", actual_compilation=False)
+        return {"status": "unavailable", "pdf_path": None,
+                "log": "Isolated TeX compilation requires bubblewrap (bwrap)",
+                "errors": [{"message": "Install bubblewrap for isolated manuscript compilation"}],
+                "preflight": report, "preflight_path": str(directory / "layout_preflight.json")}
     exit_code = 0
-    for command in commands:
+    for command in sandboxed_commands:
         try:
-            process = subprocess.run(command, cwd=directory, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout)
+            # Clear the *supervisor's* environment as well as the sandbox
+            # child's: /proc/1/environ can expose bwrap's inherited env even
+            # when --clearenv protects only the executed TeX process.
+            process = subprocess.run(command, cwd=directory, env={},
+                                     text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout)
             logs.append(process.stdout)
             exit_code = process.returncode
             if exit_code:

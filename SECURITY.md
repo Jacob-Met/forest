@@ -1,6 +1,6 @@
 # Security
 
-FOREST is a release candidate for trusted single-owner research. The default API is local to the host. Research commands have the worker user's permissions and can read, write, or access the network within that account's authority. Path checks and process supervision are not an operating-system sandbox.
+FOREST is a release candidate for trusted single-owner research. The default API is local to the host. Research commands have the worker user's permissions and can read, write, or access the network within that account's authority. Path checks and process supervision are not an operating-system sandbox. Manuscript TeX compilation is an exception on Linux: it requires a working Bubblewrap mount/user namespace to constrain source reads to the manuscript bundle and public TeX runtime. Without that boundary compilation fails closed; this isolation does not apply to arbitrary research commands.
 
 ## Deployment boundary
 
