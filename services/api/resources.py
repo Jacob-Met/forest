@@ -306,29 +306,22 @@ def analysis(body:dict=Body(...)):
         return asdict(enqueue(s,body['project_id'],'analysis',body,body.get('request_id')))
 @router.get('/api/data/{ident}/rows')
 def data_rows(ident:str,path:str|None=None,offset:int=0,limit:int=100,filter:str='',sort:str='',descending:bool=False):
-    import pandas as pd
+    from .table_rows import table_rows
     with Session() as s:
         run=s.get(TaskRun,ident); rec=s.get(Analysis,ident) if not run else None
         if not run and not rec: error('NOT_FOUND','Dataset or analysis missing',404)
         pid=run.project_id if run else rec.project_id
         rel=path or (run.output_path+'/predictions.csv' if run else rec.data.get('path',''))
     p=safe_path(project_dir(pid),rel,True)
-    frame=pd.read_parquet(p) if p.suffix=='.parquet' else infer_csv_column_types(
-        pd.read_csv(p,dtype=str,keep_default_na=False,na_values=['']))
-    if filter:
-        mask=frame.astype(str).apply(lambda col:col.str.contains(filter,case=False,regex=False)).any(axis=1); frame=frame[mask]
-    if sort in frame.columns: frame=frame.sort_values(sort,ascending=not descending)
+    before=p.stat()
+    columns,rows,total=table_rows(p,offset,limit,filter,sort,descending)
+    after=p.stat()
+    if (before.st_ino,before.st_size,before.st_mtime_ns)!=(after.st_ino,after.st_size,after.st_mtime_ns):
+        error('TABLE_CHANGED','The data table changed while it was read. Reload this page.',409,retryable=True)
     with Session() as s: revision=s.scalar(select(FileRevision).where(FileRevision.project_id==pid,FileRevision.path==rel))
     fallback='measured' if run else rec.data.get('source_origin','derived')
     origin=effective_file_origin(revision.origin if revision else None,fallback)
-    import math
-    page=frame.iloc[max(0,offset):max(0,offset)+min(limit,1000)]
-    rows=json.loads(page.to_json(orient='records'))
-    # Keep pandas' null and date encoding without rounding finite floats.
-    for row,values in zip(rows,page.to_dict(orient='records')):
-        for column,value in values.items():
-            if isinstance(value,float) and math.isfinite(value): row[column]=value
-    return {'columns':list(frame.columns),'rows':rows,'total':len(frame),'origin':origin}
+    return {'columns':columns,'rows':rows,'total':total,'origin':origin}
 @router.post('/api/figures/{ident}/render')
 def render_figure(ident:str,body:dict=Body(default={})):
     with Session.begin() as s:
