@@ -99,6 +99,53 @@ def pause_container_for_reconnect(config, output):
     return state
 
 
+def _settle_failed_container(outcome, config, output, run_id):
+    """A failed executor cannot abandon an independently running Docker task.
+
+    Also covers a killed executor that did not reach its own stop handler.
+    The receipt is host-owned, so a previously confirmed stop is durable even
+    if the Docker daemon becomes temporarily unavailable during monitoring.
+    """
+    handle=Path(output)/'container_task.json'
+    if (not outcome or outcome.get('status')!='failed' or
+            config.get('execution_backend')!='container' or not handle.is_file()):
+        return outcome
+    job=None
+    try:
+        job=json.loads(handle.read_text())
+        if not isinstance(job,dict) or not job.get('container_id') or not job.get('task_id'):
+            raise ValueError('Container ownership receipt is invalid')
+        receipt=Path(output)/'container_result.json'
+        try:
+            previous=json.loads(receipt.read_text()) if receipt.is_file() else None
+        except (OSError,ValueError,UnicodeError):
+            previous=None  # A torn result does not displace the Docker identity.
+        cleanup=None
+        if isinstance(previous,dict) and previous.get('container_id')==job['container_id']:
+            recorded=previous.get('cleanup') if isinstance(previous.get('cleanup'),dict) else previous
+            if recorded.get('stop_confirmed') is True:
+                cleanup=recorded
+        if cleanup is None:
+            state=ContainerRunner(config.get('container')).status(job)
+            if state.get('status') in ('completed','failed','cancelled','lost'):
+                cleanup={'container_id':job['container_id'],'status':state['status'],
+                         'stop_confirmed':True,'observation':'original container already terminal'}
+            else:
+                cleanup=cancel_container(config,output,run_id=run_id)
+        if not cleanup or cleanup.get('stop_confirmed') is not True:
+            raise RuntimeError('Original container stop is not confirmed')
+        return {**outcome,'container_cleanup':{
+            'container_id':job['container_id'],'stop_confirmed':True,
+            'status':cleanup.get('status')}}
+    except (OSError,ValueError,KeyError,RuntimeError) as exc:
+        return {**outcome,'status':'waiting_input',
+            'error':'Original container cleanup unconfirmed: '+str(exc),
+            'wait_for':{'type':'execution_reconciliation',
+                        'container_task':job.get('task_id') if isinstance(job,dict) else run_id,
+                        'original_error':outcome.get('error'),
+                        'original_exit_code':outcome.get('exit_code',1)}}
+
+
 def _claim_queued_candidate(session, candidate):
     """Claim a run using the shared project -> task lock order."""
     project = _lock_project(session, candidate.project_id)
@@ -157,6 +204,49 @@ def _reconcile_execution_hold(run,output):
     """Keep unknown owned computation charged until original receipts settle."""
     resource=dict(run.resource or {})
     if not resource.get('execution_reconciliation_compute_hold'):return
+    wait_for=resource.get('wait_for') or {}
+    if run.config.get('execution_backend')=='container' and wait_for.get('container_task'):
+        # The Docker process is detached from the executor. A failed log read
+        # may leave it mutating the workspace after the executor has exited.
+        # Keep this run waiting and its capacity reserved until stop is known.
+        started=float(resource.get('waiting_started_at') or time.time())
+        before=float(resource.get('elapsed_before_wait',resource.get('elapsed_seconds',0)))
+        resource['elapsed_seconds']=before+max(0,time.time()-started)
+        if time.time()<float(resource.get('container_cleanup_retry_at') or 0):
+            run.resource=resource
+            return
+        from runners.container import cancel_container
+        try:
+            cleanup=cancel_container(run.config,output,run_id=run.id)
+            if not cleanup or cleanup.get('stop_confirmed') is not True:
+                raise RuntimeError('Original container stop is not confirmed')
+        except (OSError,ValueError,KeyError,RuntimeError) as exc:
+            failures=int(resource.get('container_cleanup_failures') or 0)+1
+            resource['container_cleanup_failures']=failures
+            resource['container_cleanup_retry_at']=time.time()+min(30, 2**min(failures,4))
+            resource['blocked_reason']='execution_reconciliation'
+            resource['container_cleanup_error']=str(exc)
+            run.error='Original container stop is unconfirmed: '+str(exc)
+        else:
+            resource['container_cleanup']={
+                'stop_confirmed':True, 'status':cleanup.get('status'),
+                'container_id':cleanup.get('container_id')}
+            resource.pop('container_cleanup_error',None)
+            resource.pop('container_cleanup_retry_at',None)
+            resource.pop('execution_reconciliation_compute_hold',None)
+            resource.pop('waiting_started_at',None)
+            resource.pop('elapsed_before_wait',None)
+            resource.update(wait_for={},blocked_reason=None)
+            run.status='failed'
+            run.exit_code=wait_for.get('original_exit_code',1)
+            run.error=wait_for.get('original_error') or 'Container execution failed'
+            run.finished_at=now()
+            attempts=resource.get('attempts') or []
+            if attempts and attempts[-1].get('status')=='waiting_input':
+                resource['attempts']=[*attempts[:-1], {**attempts[-1],
+                    'status':'failed', 'error':run.error, 'exit_code':run.exit_code}]
+        run.resource=resource
+        return
     manager=None;inspection_error=None
     try:
         manager=process_manager(Path(output)/'workspace',run.config)
@@ -948,6 +1038,8 @@ class WorkerLoop:
                      'budget_exhausted':True,'elapsed_seconds':elapsed}
         elif outcome is None and not alive:
             outcome={'status':'interrupted','exit_code':proc.returncode if proc else None,'error':'Task process ended without a current completion receipt.'}
+        if outcome is not None and not alive:
+            outcome=_settle_failed_container(outcome,value['config'],output,ident)
         with Session.begin() as s:
             _lock_project(s,value['project_id'])
             r=s.scalar(select(TaskRun).where(TaskRun.id==ident).with_for_update())
@@ -955,6 +1047,8 @@ class WorkerLoop:
             if r.worker_id!=self.id: return
             if r.config.get('execution_attempt',{}).get('id')!=value['config'].get('execution_attempt',{}).get('id'): return
             r.resource={**r.resource,**resource}
+            if outcome and outcome.get('container_cleanup'):
+                r.resource={**r.resource,'container_cleanup':outcome['container_cleanup']}
             if log.exists() and self.log_offsets.get(ident)!=log.stat().st_size:
                 self.log_offsets[ident]=log.stat().st_size; emit(s,r.project_id,'run_progress',{'run_id':r.id,'output_offset':log.stat().st_size})
             if outcome:

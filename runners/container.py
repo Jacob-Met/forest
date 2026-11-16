@@ -231,7 +231,8 @@ class ContainerRunner:
         result = self.status(job)
         if result['status'] in ('running', 'paused', 'starting'):
             raise RuntimeError('Container stop remains unconfirmed')
-        return {**result, 'status': 'cancelled', 'cancel_requested_at': time.time()}
+        return {**result, 'status': 'cancelled', 'stop_confirmed': True,
+                'cancel_requested_at': time.time()}
 
     def pause(self, job):
         info=self._verified(job)
@@ -310,7 +311,33 @@ def execute_container(config, workspace, output, env=None, require_metrics=False
     cursor = json.loads(cursor_path.read_text()) if cursor_path.exists() else None
     while True:
         status = runner.status(job)
-        chunk = runner.output(job, cursor) if status['status'] != 'lost' else {'text': '', 'cursor': cursor}
+        try:
+            chunk = runner.output(job, cursor) if status['status'] != 'lost' else {'text': '', 'cursor': cursor}
+        except Exception as exc:
+            # Docker logs can time out while the detached container continues
+            # working. Failure cannot be published until its identity-checked
+            # container is stopped, or responsibility is retained for retry.
+            failure = f'Container log observation failed: {type(exc).__name__}: {exc}'
+            try:
+                cleanup = runner.stop(job)
+                if not cleanup.get('stop_confirmed'):
+                    raise RuntimeError('Container stop acknowledgement missing')
+            except Exception as stop_exc:
+                from research.agents.runtime import AgentYield
+                reason = failure + '; cleanup unconfirmed: ' + str(stop_exc)
+                try:
+                    _save(result_path, {'status': 'reconciliation', 'error': failure,
+                        'cleanup_error': str(stop_exc), 'container_id': job['container_id']})
+                except OSError:
+                    # The independent executor receipt still advertises the
+                    # unconfirmed stop, even if disk output cannot be updated.
+                    pass
+                raise AgentYield('waiting_input', wait_for={
+                    'type': 'execution_reconciliation', 'container_task': job['task_id'],
+                    'original_error': failure, 'original_exit_code': 1}, reason=reason) from stop_exc
+            _save(result_path, {'status': 'failed', 'error': failure,
+                'container_id': job['container_id'], 'cleanup': cleanup})
+            raise RuntimeError(failure + '; container stop confirmed') from exc
         if chunk['text']:
             print(chunk['text'], end='', flush=True)
         cursor = chunk['cursor']
