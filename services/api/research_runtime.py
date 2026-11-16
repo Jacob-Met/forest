@@ -55,8 +55,9 @@ def publication_state(ident:str):
 @router.patch('/api/projects/{ident}/publication')
 def configure_publication(ident:str,body:dict=Body(...)):
     from research.publication import publication_profile
+    from services.worker.scheduler import _lock_project
     with Session.begin() as s:
-        p=get(s,Project,ident)
+        p=_lock_project(s,ident)
         current=p.config.get('publication_profile',{})
         if isinstance(current,str):current={'id':current}
         try:profile=publication_profile({'publication_profile':{**current,**body}})
@@ -295,8 +296,9 @@ def paired_statistics(ident:str,body:dict=Body(...)):
 def edit_objective(ident:str,body:dict=Body(...)):
     metric=str(body.get('metric','')).strip()
     if body.get('direction','min') not in ('min','max'):error('INVALID_OBJECTIVE','Choose min or max',422)
+    from services.worker.scheduler import _lock_project
     with Session.begin() as s:
-        p=get(s,Project,ident)
+        p=_lock_project(s,ident)
         p.config={**p.config,'objective':({'metric':metric,'direction':body.get('direction','min'),'comparison_fields':body.get('comparison_fields',['dataset','protocol_version'])} if metric else {})}
         p.revision+=1;emit(s,ident,'project_changed',{'revision':p.revision})
         return p.config['objective']
