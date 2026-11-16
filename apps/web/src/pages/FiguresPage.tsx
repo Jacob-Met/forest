@@ -208,6 +208,15 @@ function FigureEditor({
   const outputs = figure.data.outputs || {};
   const imagePath =
     outputs.svg || outputs.png || figure.data.svg_path || figure.data.png_path;
+  const approveImportedCode = () =>
+    figure.data.code_origin !== "imported_untrusted" ||
+    code === (figure.data.code || "") ||
+    confirm(
+      t(
+        "导入的 Python 代码尚未受信任。保存修改会允许渲染时执行此代码。你已检查并信任它吗？",
+        "Imported Python has not been trusted. Saving your edited code enables it to execute during rendering. Have you reviewed and trusted it?",
+      ),
+    );
   const save = async () => {
     const r = await api(`/figures/${figure.id}`, "PATCH", {
       expected_revision: editRevision,
@@ -509,18 +518,28 @@ function FigureEditor({
             </div>
           )}
         </div>
+        {figure.data.code_origin === "imported_untrusted" && (
+          <p className="muted" role="status">
+            {t(
+              "导入的 Python 代码不会执行。绘图使用内置渲染器；如需运行自定义代码，请先检查并修改它。",
+              "Imported Python is disabled. The built-in renderer is used; review and edit the code to enable custom execution.",
+            )}
+          </p>
+        )}
         <div className="inline-actions">
           <Button
-            onClick={() =>
-              action(save, t("图表配置已保存", "Figure configuration saved"))
-            }
+            onClick={() => {
+              if (!approveImportedCode()) return;
+              action(save, t("图表配置已保存", "Figure configuration saved"));
+            }}
           >
             <Save size={14} />
             {t("保存", "Save")}
           </Button>
           <Button
             className="primary"
-            onClick={() =>
+            onClick={() => {
+              if (!approveImportedCode()) return;
               action(
                 async () => {
                   await save();
@@ -530,8 +549,8 @@ function FigureEditor({
                   await reload();
                 },
                 t("绘图任务已排队", "Figure render queued"),
-              )
-            }
+              );
+            }}
           >
             <Play size={13} />
             {t("生成图表", "Render figure")}
