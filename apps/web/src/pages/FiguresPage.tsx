@@ -7,6 +7,7 @@ import {
   Save,
   Send,
   X,
+  ShieldAlert,
 } from "lucide-react";
 import { api, download, uid, parseJson } from "../api";
 import type { Json, RecordItem, Run } from "../api";
@@ -89,6 +90,17 @@ export function FiguresPage() {
               </button>
             ))}
           </div>
+          {figure?.data.code_origin === "imported_untrusted" && (
+            <div className="figure-import-warning" role="status">
+              <ShieldAlert size={17} />
+              <span>
+                {t(
+                  "导入的 Python 代码不会执行，当前使用内置绘图器。检查并修改代码后才能运行自定义版本。",
+                  "Imported Python is disabled. Rendering uses the built-in renderer until you review and edit the code.",
+                )}
+              </span>
+            </div>
+          )}
           {figure && (
             <FigureEditor
               key={figure.id}
@@ -208,6 +220,15 @@ function FigureEditor({
   const outputs = figure.data.outputs || {};
   const imagePath =
     outputs.svg || outputs.png || figure.data.svg_path || figure.data.png_path;
+  const approveImportedCode = () =>
+    figure.data.code_origin !== "imported_untrusted" ||
+    code === (figure.data.code || "") ||
+    confirm(
+      t(
+        "导入的 Python 代码尚未受信任。保存修改会允许渲染时执行此代码。你已检查并信任它吗？",
+        "Imported Python has not been trusted. Saving your edited code enables it to execute during rendering. Have you reviewed and trusted it?",
+      ),
+    );
   const save = async () => {
     const r = await api(`/figures/${figure.id}`, "PATCH", {
       expected_revision: editRevision,
@@ -511,16 +532,18 @@ function FigureEditor({
         </div>
         <div className="inline-actions">
           <Button
-            onClick={() =>
-              action(save, t("图表配置已保存", "Figure configuration saved"))
-            }
+            onClick={() => {
+              if (!approveImportedCode()) return;
+              action(save, t("图表配置已保存", "Figure configuration saved"));
+            }}
           >
             <Save size={14} />
             {t("保存", "Save")}
           </Button>
           <Button
             className="primary"
-            onClick={() =>
+            onClick={() => {
+              if (!approveImportedCode()) return;
               action(
                 async () => {
                   await save();
@@ -530,8 +553,8 @@ function FigureEditor({
                   await reload();
                 },
                 t("绘图任务已排队", "Figure render queued"),
-              )
-            }
+              );
+            }}
           >
             <Play size={13} />
             {t("生成图表", "Render figure")}

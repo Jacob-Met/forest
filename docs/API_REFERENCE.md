@@ -630,7 +630,7 @@ Known domain failures: `403` PATH_ESCAPE; `404` NOT_FOUND or MISSING_ARTIFACT; `
 
 #### `POST /api/figures/{ident}/render`
 
-Capture figure_id/revision/data plus body overrides and return a queued Run. Optional body request_id/configuration is passed to the figure worker; outputs are available only after the task completes and its resource is updated.
+Capture figure_id/revision/data plus body overrides and return a queued Run. Optional body request_id/configuration is passed to the figure worker; outputs are available only after the task completes and its resource is updated. Figure code imported from a project archive is inert and uses native rendering until the owner explicitly reviews and edits it.
 
 | Parameter | Location | Type | Required | Default / description |
 | --- | --- | --- | --- | --- |
@@ -660,7 +660,7 @@ Known domain failures: `404` NOT_FOUND; `409` REVISION_CONFLICT.
 
 #### `POST /api/projects/import`
 
-multipart/form-data file with forest-project-v1 manifest. Validate graph and archive paths, reject symlinks/path traversal, more than `max_project_archive_members` ZIP entries (default `10000`, configured by `FOREST_MAX_PROJECT_ARCHIVE_MEMBERS`), and >500 MiB decompressed archives. The member count includes directories and entries outside `files/`; rejection returns `413 ARCHIVE_TOO_LARGE` before manifest access or project creation. The configured limit must be a positive integer. Create a new project with remapped graph/resource identifiers; preserve its selected provider when that ID exists in the current workspace. If the saved provider is unavailable, mark provider_selection_required and prevent provider-backed runs from silently falling back until the owner edits project settings. Active imported work is interrupted and execution is not replayed.
+multipart/form-data file with forest-project-v1 manifest. Validate graph and archive paths, reject symlinks/path traversal, more than `max_project_archive_members` ZIP entries (default `10000`, configured by `FOREST_MAX_PROJECT_ARCHIVE_MEMBERS`), and >500 MiB decompressed archives. The member count includes directories and entries outside `files/`; rejection returns `413 ARCHIVE_TOO_LARGE` before manifest access or project creation. The configured limit must be a positive integer. Create a new project with remapped graph/resource identifiers; preserve its selected provider when that ID exists in the current workspace. If the saved provider is unavailable, mark provider_selection_required and prevent provider-backed runs from silently falling back until the owner edits project settings. Active imported work is interrupted and execution is not replayed. Non-renderer Python saved on imported figures is preserved as untrusted source: default rendering uses the built-in renderer, and the owner must edit and explicitly approve code before custom execution.
 
 Body: `multipart/form-data`: `Body_import_project_api_projects_import_post`; required.
 

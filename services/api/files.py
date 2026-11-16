@@ -641,6 +641,20 @@ def cleanup_project_import_on_failure():
                 pass
         raise
 
+def _untrust_imported_figure(figure):
+    """Archive code is evidence to review, never an executable task by default."""
+    if isinstance(figure, dict) and figure.get('code') and figure.get('code_origin') != 'renderer':
+        return {**figure, 'code_origin': 'imported_untrusted'}
+    return figure
+
+
+def _untrust_figure_snapshot(config):
+    # Figure code can be embedded in a graph node OR a retryable run.
+    if isinstance(config,dict) and 'figure' in config:
+        return {**config,'figure':_untrust_imported_figure(config['figure'])}
+    return config
+
+
 @router.post('/api/projects/import')
 async def import_project(file:UploadFile=File(...)):
     from research.kernel import validate_graph,ArtifactResolver
@@ -722,8 +736,9 @@ async def import_project(file:UploadFile=File(...)):
         graph=historical_branches(remap(graph)); graph['project_id']=p.id; graph['revision']=0; graph.pop('_history',None)
         node_configs={mapping[row['id']]:row.get('config',{}) for row in manifest['graph']['nodes']}
         for node in graph['nodes']:
-            node['config']=relocate_permission_config(node_configs[node['id']],node.get('config',{}),root,
-                                                     manifest.get('workspace_origin_root'),remap)
+            node['config']=_untrust_figure_snapshot(relocate_permission_config(
+                node_configs[node['id']],node.get('config',{}),root,
+                manifest.get('workspace_origin_root'),remap))
         for node in graph['nodes']:
             if node.get('execution_status') in ('queued','running','pausing','paused','waiting_input'):
                 node['imported_execution_status']=node['execution_status']; node['execution_status']='interrupted'
@@ -741,18 +756,24 @@ async def import_project(file:UploadFile=File(...)):
         for key,rows in manifest.get('resources',{}).items():
             model=RESOURCE_MODELS.get(key)
             if model:
-                for r in rows: s.add(model(id=mapping[r['id']],project_id=p.id,title=r['title'],data=remap(r['data']),status=r['status']))
+                for r in rows:
+                    data = remap(r['data'])
+                    if model is Figure: data = _untrust_imported_figure(data)
+                    s.add(model(id=mapping[r['id']],project_id=p.id,title=r['title'],data=data,status=r['status']))
         for r in manifest.get('papers',[]): s.add(PaperDocument(id=mapping[r['id']],project_id=p.id,title=r['title'],data=remap(r['data']),status=r['status']))
         for r in manifest.get('runs',[]):
             # Imported measurements retain their original run identifiers inside source data; execution is not replayed.
             ident=mapping[r['id']]
             timestamps=run_timestamps[r['id']]
+            # Terminal imported runs can be retried and graph nodes re-launched.
+            # Preserved Python source must not regain executable authority.
+            run_config=_untrust_figure_snapshot(remap(r.get('config',{})))
             s.add(TaskRun(
                 id=ident,project_id=p.id,node_id=remap(r.get('node_id')),
                 branch_id=remap(r.get('branch_id')),request_id='import:'+ident,
                 kind=r['kind'],
                 status=r['status'] if r['status'] in ('completed','failed','cancelled') else 'interrupted',
-                config={**remap(r.get('config',{})),'origin':'imported_run','original_run_id':r['id']},
+                config={**run_config,'origin':'imported_run','original_run_id':r['id']},
                 node_revision=r.get('node_revision',0),
                 created_at=timestamps['created_at'],
                 started_at=timestamps['started_at'],

@@ -736,7 +736,8 @@ def execute(run_id):
             else: raise ValueError('Multiple-run statistical plots require identified statistics.observations or per_seed results in their metric artifacts')
         else: raise ValueError('Choose real completed runs or explicitly imported figure data')
         target=output/'figure'; selection=None
-        custom_code=fig.get('code') and fig.get('code_origin')!='renderer'
+        imported_code=fig.get('code_origin')=='imported_untrusted'
+        custom_code=bool(fig.get('code')) and fig.get('code_origin') not in ('renderer','imported_untrusted')
         provider=config.get('provider_snapshot')
         if fig.get('kind')=='method' and not data.get('nodes'):
             if not provider: raise ValueError('Supply method nodes/edges or connect the Method Illustrator model')
@@ -815,8 +816,8 @@ def execute(run_id):
                 reviewed=selection is not None
                 f.data={**fig,'data':data,'outputs':rel,'source_run_ids':[r.id for r in selected],
                     'visual_selection':selection,'visual_review_status':'selected' if reviewed else 'awaiting_independent_reviews',
-                    'code_origin':'custom' if custom_code else 'renderer',
-                    'code':Path(paths['source']).read_text() if paths.get('source') and Path(paths['source']).suffix=='.py' else fig.get('code','')}
+                    'code_origin':'imported_untrusted' if imported_code else ('custom' if custom_code else 'renderer'),
+                    'code':fig.get('code','') if imported_code else (Path(paths['source']).read_text() if paths.get('source') and Path(paths['source']).suffix=='.py' else fig.get('code',''))}
                 f.revision+=1;touch_dependents(s,pid,fid)
                 f.status='ready_for_review' if reviewed else 'needs_review'
             emit(s,pid,'artifact_available',{'kind':'figure','id':fid,'run_id':run_id})
