@@ -64,6 +64,10 @@ class ToolRuntime:
         Otherwise a replayed chunk can truncate the owner's newer bytes and
         still leave the owner's FileRevision token and origin unchanged.
         """
+        if project_id is None:
+            # Standalone tool dispatch has no owner project or shared publication path.
+            yield
+            return
         from services.api.files import file_publication_lock
         root = project_dir(project_id).resolve()
         try:
