@@ -605,7 +605,7 @@ test("compact shared pane traps focus and preserves analysis drafts across Paper
   }
 });
 
-test("actual same-revision source changes reject the retained analysis fingerprint until explicit context review", async ({
+test("actual same-revision source changes block a stale draft until explicit context review", async ({
   page,
   request,
 }) => {
@@ -681,22 +681,10 @@ test("actual same-revision source changes reject the retained analysis fingerpri
         { exact: true },
       ),
     ).toBeVisible();
-    const rejection = page.waitForResponse(
-      (response) =>
-        response.request().method() === "POST" &&
-        response
-          .url()
-          .endsWith(`/api/projects/${project.id}/research/analysis`),
-    );
-    await pane(page)
-      .getByRole("button", { name: "Request AI analysis" })
-      .click();
-    const rejected = await rejection;
-    expect(rejected.status()).toBe(409);
-    expect((await rejected.json()).detail.code).toBe("CONTEXT_CHANGED");
-    expect(submitted[0].expected_fingerprint).toBe(
-      original.snapshot.fingerprint,
-    );
+    await expect(
+      pane(page).getByRole("button", { name: "Request AI analysis" }),
+    ).toBeDisabled();
+    expect(submitted).toHaveLength(0);
     await expect(pane(page).getByLabel("Analysis question")).toHaveValue(
       "Question retains original source intent",
     );
@@ -725,6 +713,113 @@ test("actual same-revision source changes reject the retained analysis fingerpri
     expect(stored.baseFingerprint).toBe(changed.snapshot.fingerprint);
     expect(stored.intent).toBeUndefined();
     expect(stored.question).toBe("Question retains original source intent");
+  } finally {
+    await request.delete(`/api/projects/${project.id}`);
+  }
+});
+
+test("changing the Researcher model leaves the draft visible but blocks silent dispatch to the previous model", async ({
+  page,
+  request,
+}) => {
+  const { project, alpha } = await fixture(request);
+  let selectedProvider = "model-a-fixture";
+  const submitted: any[] = [];
+  await page.route(
+    `**/api/projects/${project.id}/research/analysis/context?*`,
+    async (route) => {
+      const response = await route.fetch();
+      const context = await response.json();
+      await route.fulfill({
+        response,
+        json: {
+          ...context,
+          provider: {
+            available: true,
+            id: selectedProvider,
+            name: selectedProvider,
+            model: "offline-browser-fixture",
+            kind: "fixture",
+          },
+        },
+      });
+    },
+  );
+  await page.route(
+    `**/api/projects/${project.id}/research/analysis`,
+    async (route) => {
+      if (route.request().method() !== "POST") {
+        await route.continue();
+        return;
+      }
+      submitted.push(route.request().postDataJSON());
+      await route.fulfill({
+        json: protocolRun(project.id, "browser-provider-switch-run"),
+      });
+    },
+  );
+  try {
+    await page.goto(
+      `/projects/${project.id}/workspace?analysis=1&analysis_scope=node&node=${alpha.id}`,
+    );
+    await expect(
+      pane(page).getByRole("button", { name: "Request AI analysis" }),
+    ).toBeEnabled();
+    await pane(page)
+      .getByLabel("Analysis question")
+      .fill("Persist this question while I change models");
+    selectedProvider = "model-b-fixture";
+    await page.evaluate(() =>
+      window.dispatchEvent(new Event("forest-refresh")),
+    );
+    await expect(
+      pane(page).getByText(
+        "Analysis model changed; this draft still targets the previous provider. Use current context before requesting analysis.",
+        { exact: true },
+      ),
+    ).toBeVisible();
+    await expect(
+      pane(page).getByRole("button", { name: "Request AI analysis" }),
+    ).toBeDisabled();
+    expect(submitted).toHaveLength(0);
+    // A full reload and the compact layout must keep the stale-provider warning.
+    await page.reload();
+    await page.setViewportSize({ width: 390, height: 844 });
+    await expect(
+      pane(page).getByText(
+        "Analysis model changed; this draft still targets the previous provider.",
+        {
+          exact: false,
+        },
+      ),
+    ).toBeVisible();
+    await expect(pane(page).getByLabel("Analysis question")).toHaveValue(
+      "Persist this question while I change models",
+    );
+    expect(
+      await page.evaluate(
+        () => document.documentElement.scrollWidth <= innerWidth,
+      ),
+    ).toBeTruthy();
+    await pane(page)
+      .getByRole("button", { name: "Use current context" })
+      .click();
+    await expect(
+      pane(page).getByText(
+        "Analysis model changed; this draft still targets the previous provider.",
+        {
+          exact: false,
+        },
+      ),
+    ).toHaveCount(0);
+    await pane(page)
+      .getByRole("button", { name: "Request AI analysis" })
+      .click();
+    await expect.poll(() => submitted.length).toBe(1);
+    expect(submitted[0].provider_id).toBe("model-b-fixture");
+    expect(submitted[0].question).toBe(
+      "Persist this question while I change models",
+    );
   } finally {
     await request.delete(`/api/projects/${project.id}`);
   }
