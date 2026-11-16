@@ -19,8 +19,7 @@ def test_read_page_uses_declared_response_charset(tmp_path, monkeypatch):
     def stream(*args, **kwargs):
         yield response
 
-    monkeypatch.setattr(browser.httpx, 'stream', stream)
-    monkeypatch.setattr(browser, '_public_url', lambda url: None)
+    monkeypatch.setattr(browser, '_public_stream', stream)
 
     result = browser.read_page('https://example.org/page', tmp_path)
 
