@@ -3,12 +3,14 @@
 Generated bundles remain ordinary files in their run directories. Replacing an edited or newer
 working manuscript requires applying a concrete review against its exact revision.
 """
+import logging
+import shutil
 from copy import deepcopy
 from difflib import unified_diff
 from pathlib import Path
-import shutil
+from uuid import uuid4
 
-from sqlalchemy import select
+from sqlalchemy import event, select
 from sqlalchemy.orm import object_session
 
 from .common import emit, error, get, project_dir, safe_path
@@ -131,27 +133,115 @@ def manually_edited(paper):
     return False
 
 
+def _discard_manuscript_batch(batch):
+    for _, staged, backup in batch:
+        staged.unlink(missing_ok=True)
+        if backup is not None:
+            backup.unlink(missing_ok=True)
+
+
+def _restore_manuscript_batch(batch):
+    # Revert in reverse publication order, preserving the exact previous bytes.
+    for path, _, backup in reversed(batch):
+        if backup is None:
+            path.unlink(missing_ok=True)
+        else:
+            backup.replace(path)
+    _discard_manuscript_batch(batch)
+
+
+def _retain_manuscript_backups(session, batch):
+    # SQL rollback can happen after all filesystem replacements succeeded.
+    # Hold the pre-transaction files until the database has committed too.
+    key = '_working_manuscript_file_batches'
+    if key not in session.info:
+        session.info[key] = []
+
+        def rollback(db_session):
+            batches = db_session.info[key]
+            db_session.info[key] = []
+            failure = None
+            for saved in reversed(batches):
+                try:
+                    _restore_manuscript_batch(saved)
+                except OSError as exc:
+                    failure = failure or exc
+            if failure is not None:
+                raise RuntimeError('Manuscript transaction aborted and file compensation failed') from failure
+
+        def commit(db_session):
+            batches = db_session.info[key]
+            db_session.info[key] = []
+            for saved in batches:
+                try:
+                    _discard_manuscript_batch(saved)
+                except OSError as exc:
+                    # The SQL and files have committed. Do not report the edit
+                    # as failed solely because a stale backup could not be removed.
+                    logging.getLogger(__name__).warning(
+                        'Committed manuscript backup cleanup failed: %s', exc)
+
+        event.listen(session, 'after_rollback', rollback)
+        event.listen(session, 'after_commit', commit)
+    session.info[key].append(batch)
+
+
 def write_working_source(paper):
     session = object_session(paper)
     if session is None:
         raise ValueError('Working manuscript writes require a database transaction')
     folder = safe_path(project_dir(paper.project_id), 'paper')
     folder.mkdir(parents=True, exist_ok=True)
-    for name, value in (('paper.tex', paper.data.get('source', '')),
-                        ('references.bib', paper.data.get('bibtex', ''))):
-        path = safe_path(folder, name)
-        temporary = path.with_name(path.name + '.forest-tmp')
-        temporary.write_text(value, encoding='utf-8')
-        temporary.replace(path)
-        relative = 'paper/' + name
-        revision = session.scalar(select(FileRevision).where(
-            FileRevision.project_id == paper.project_id, FileRevision.path == relative
-        ).with_for_update().execution_options(populate_existing=True))
-        if revision is None:
-            revision = FileRevision(project_id=paper.project_id, path=relative, revision=0)
-            session.add(revision)
-        revision.revision += 1
-        revision.origin = 'user_edited' if paper.data.get('manually_edited') else 'generated'
+    batch = []
+    transient = []
+    installing = False
+    try:
+        # Prepare both replacements and their original contents before touching
+        # either working file. Unique names avoid collisions with earlier attempts.
+        for name, value in (('paper.tex', paper.data.get('source', '')),
+                            ('references.bib', paper.data.get('bibtex', ''))):
+            path = safe_path(folder, name)
+            suffix = uuid4().hex
+            staged = path.with_name('.' + path.name + '.' + suffix + '.forest-tmp')
+            transient.append(staged)
+            staged.write_text(value, encoding='utf-8')
+            backup = None
+            if path.exists():
+                backup = path.with_name('.' + path.name + '.' + suffix + '.forest-backup')
+                transient.append(backup)
+                shutil.copy2(path, backup)
+            batch.append((path, staged, backup))
+
+        installing = True
+        for path, staged, _ in batch:
+            staged.replace(path)
+        for name in ('paper.tex', 'references.bib'):
+            relative = 'paper/' + name
+            revision = session.scalar(select(FileRevision).where(
+                FileRevision.project_id == paper.project_id, FileRevision.path == relative
+            ).with_for_update().execution_options(populate_existing=True))
+            if revision is None:
+                revision = FileRevision(project_id=paper.project_id, path=relative, revision=0)
+                session.add(revision)
+            revision.revision += 1
+            revision.origin = 'user_edited' if paper.data.get('manually_edited') else 'generated'
+        _retain_manuscript_backups(session, batch)
+    except BaseException:
+        if installing:
+            _restore_manuscript_batch(batch)
+        else:
+            # Staging can fail halfway through copying a backup that has not
+            # yet been added to batch; remove every partial temporary file.
+            for path in transient:
+                path.unlink(missing_ok=True)
+        raise
+    finally:
+        # Successfully installed staged files no longer exist. Clean up those
+        # left behind by a partial staging failure, without deleting backups
+        # retained until the enclosing SQL transaction resolves.
+        for staged in transient:
+            if staged.name.endswith('.forest-tmp'):
+                staged.unlink(missing_ok=True)
 
 
 def sync_working_file_edit(session, project_id, relative, content):

@@ -105,6 +105,160 @@ def case_manual_edits_proposal_and_safe_apply(client):
     assert ok(client.get('/api/reviews/' + fresh['review_id']))['status'] == 'applied'
 
 
+def case_paired_manuscript_write_rolls_back_on_second_replace(client):
+    from unittest.mock import patch
+    from services.api.common import project_dir
+    pid = project(client)
+    assert publish(pid, enqueue_generation(pid), bundle(pid, 'initial', 'Original text. '))['publication'] == 'applied'
+    paper = ok(client.get('/api/papers/' + pid))
+    stable = project_dir(pid) / 'paper'
+    original_source = (stable / 'paper.tex').read_bytes()
+    original_bib = (stable / 'references.bib').read_bytes()
+    files = '/api/projects/' + pid + '/file'
+    source_before = ok(client.get(files, params={'path': 'paper/paper.tex'}))
+    bib_before = ok(client.get(files, params={'path': 'paper/references.bib'}))
+    replace = Path.replace
+    count = 0
+
+    def fail_second_staged_replace(path, target):
+        nonlocal count
+        if path.name.endswith('.forest-tmp'):
+            count += 1
+            if count == 2:
+                raise OSError('simulated bibliography publication failure')
+        return replace(path, target)
+
+    with patch.object(Path, 'replace', fail_second_staged_replace):
+        with pytest.raises(OSError, match='simulated bibliography publication failure'):
+            client.patch('/api/papers/' + pid, json={
+                'expected_revision': paper['revision'],
+                'data': {'source': document('Uncommitted text. '), 'bibtex': '% Uncommitted bibliography'}})
+    assert count == 2
+    assert (stable / 'paper.tex').read_bytes() == original_source
+    assert (stable / 'references.bib').read_bytes() == original_bib
+    assert ok(client.get('/api/papers/' + pid))['revision'] == paper['revision']
+    assert ok(client.get('/api/papers/' + pid))['data'] == paper['data']
+    assert ok(client.get(files, params={'path': 'paper/paper.tex'})) == source_before
+    assert ok(client.get(files, params={'path': 'paper/references.bib'})) == bib_before
+
+
+def case_paired_manuscript_staging_failure_leaves_no_partial_backup(client):
+    from unittest.mock import patch
+    from services.api.common import project_dir
+    pid = project(client)
+    assert publish(pid, enqueue_generation(pid), bundle(pid, 'initial', 'Original text. '))['publication'] == 'applied'
+    paper = ok(client.get('/api/papers/' + pid))
+    stable = project_dir(pid) / 'paper'
+    original = [(stable / name).read_bytes() for name in ('paper.tex', 'references.bib')]
+    copy = shutil.copy2
+    count = 0
+
+    def fail_staging_second_backup(source, target, *args, **kwargs):
+        nonlocal count
+        if Path(target).name.endswith('.forest-backup'):
+            count += 1
+            if count == 2:
+                Path(target).write_bytes(b'partial backup')
+                raise OSError('simulated backup copy failure')
+        return copy(source, target, *args, **kwargs)
+
+    with patch('services.api.paper_state.shutil.copy2', fail_staging_second_backup):
+        with pytest.raises(OSError, match='simulated backup copy failure'):
+            client.patch('/api/papers/' + pid, json={
+                'expected_revision': paper['revision'],
+                'data': {'source': document('Uncommitted text.'), 'bibtex': '% Uncommitted'}})
+    assert count == 2
+    assert [(stable / name).read_bytes() for name in ('paper.tex', 'references.bib')] == original
+    assert ok(client.get('/api/papers/' + pid)) == paper
+    assert not list(stable.glob('.*.forest-*'))
+
+
+def case_manuscript_pair_reverts_when_database_transaction_rolls_back(client):
+    from services.api.common import project_dir
+    from services.api.db import Session
+    from services.api.paper_state import locked_project_paper, write_working_source
+    pid = project(client)
+    assert publish(pid, enqueue_generation(pid), bundle(pid, 'initial', 'Original text. '))['publication'] == 'applied'
+    paper = ok(client.get('/api/papers/' + pid))
+    stable = project_dir(pid) / 'paper'
+    original = [(stable / name).read_bytes() for name in ('paper.tex', 'references.bib')]
+    with pytest.raises(RuntimeError, match='rollback after both replacements'):
+        with Session.begin() as session:
+            current = locked_project_paper(session, pid)
+            for text in ('First uncommitted.', 'Second uncommitted.'):
+                current.data = {**current.data, 'source': document(text), 'bibtex': '% ' + text}
+                current.revision += 1
+                write_working_source(current)
+            assert 'Second uncommitted.' in (stable / 'paper.tex').read_text()
+            raise RuntimeError('rollback after both replacements')
+    assert [(stable / name).read_bytes() for name in ('paper.tex', 'references.bib')] == original
+    assert ok(client.get('/api/papers/' + pid)) == paper
+    assert not list(stable.glob('.*.forest-*'))
+    committed = ok(client.patch('/api/papers/' + pid, json={
+        'expected_revision': paper['revision'],
+        'data': {'source': document('Committed.'), 'bibtex': '% Committed.'}}))
+    assert committed['revision'] == paper['revision'] + 1
+    assert (stable / 'paper.tex').read_text() == committed['data']['source']
+    assert (stable / 'references.bib').read_text() == committed['data']['bibtex']
+    assert not list(stable.glob('.*.forest-*'))
+
+
+def case_manuscript_pair_restores_if_database_commit_fails(client):
+    from sqlalchemy import event
+    from services.api.common import project_dir
+    from services.api.db import Session
+    from services.api.paper_state import locked_project_paper, write_working_source
+    pid = project(client)
+    assert publish(pid, enqueue_generation(pid), bundle(pid, 'initial', 'Original text. '))['publication'] == 'applied'
+    paper = ok(client.get('/api/papers/' + pid))
+    folder = project_dir(pid) / 'paper'
+    original = [(folder / name).read_bytes() for name in ('paper.tex', 'references.bib')]
+
+    with pytest.raises(RuntimeError, match='simulated commit failure'):
+        with Session() as session:
+            @event.listens_for(session, 'before_commit')
+            def reject_commit(_session):
+                raise RuntimeError('simulated commit failure')
+
+            with session.begin():
+                current = locked_project_paper(session, pid)
+                current.data = {**current.data, 'source': document('Uncommitted.'), 'bibtex': '% Uncommitted.'}
+                current.revision += 1
+                write_working_source(current)
+    assert [(folder / name).read_bytes() for name in ('paper.tex', 'references.bib')] == original
+    assert ok(client.get('/api/papers/' + pid)) == paper
+    assert not list(folder.glob('.*.forest-*'))
+
+
+def case_manuscript_commit_stays_successful_if_backup_cleanup_fails(client):
+    from unittest.mock import patch
+    from services.api.common import project_dir
+    pid = project(client)
+    assert publish(pid, enqueue_generation(pid), bundle(pid, 'initial', 'Original text. '))['publication'] == 'applied'
+    paper = ok(client.get('/api/papers/' + pid))
+    folder = project_dir(pid) / 'paper'
+    unlink = Path.unlink
+    failures = 0
+
+    def fail_first_backup_cleanup(path, *args, **kwargs):
+        nonlocal failures
+        if path.name.endswith('.forest-backup') and failures == 0:
+            failures += 1
+            raise OSError('simulated cleanup permission error')
+        return unlink(path, *args, **kwargs)
+
+    with patch.object(Path, 'unlink', fail_first_backup_cleanup):
+        committed = ok(client.patch('/api/papers/' + pid, json={
+            'expected_revision': paper['revision'],
+            'data': {'source': document('Committed.'), 'bibtex': '% Committed.'}}))
+    assert failures == 1
+    assert committed['revision'] == paper['revision'] + 1
+    assert ok(client.get('/api/papers/' + pid)) == committed
+    assert (folder / 'paper.tex').read_text() == committed['data']['source']
+    for stale in folder.glob('.*.forest-backup'):
+        stale.unlink()
+
+
 def case_newer_generation_and_simultaneous_publication(client):
     pid = project(client)
     initial = publish(pid, enqueue_generation(pid), bundle(pid, 'initial', 'Initial. '))
