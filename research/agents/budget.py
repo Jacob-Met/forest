@@ -149,6 +149,8 @@ def make_request_guard(provider):
         with Session.begin() as s:
             current = lock_provider(s, ident)
             if phase == 'before':
+                if current.status == 'retired':
+                    raise BudgetExceeded('Provider is retired; no new model requests are authorized')
                 local_reporting = (bool(context.get('report_job_id')) or current.kind == 'codex_cli') and __import__('urllib.parse',fromlist=['urlparse']).urlparse(current.base_url).hostname in ('localhost','127.0.0.1','::1')
                 if not current.allow_paid and not local_reporting:
                     raise BudgetExceeded('Paid API calls are disabled for this provider')
