@@ -2,6 +2,7 @@ export type AnalysisScope = "project" | "node" | "branch";
 export type AnalysisPayload = {
   expected_revision: number;
   expected_fingerprint?: string;
+  expected_provider_id?: string;
   scope: AnalysisScope;
   node_id?: string;
   branch_id?: string;
@@ -23,6 +24,19 @@ export type AnalysisDraft = {
   lastRunId: string;
   intent?: { serialized: string; requestId: string; payload: AnalysisPayload };
 };
+
+/** Provider settings can change without changing graph revision or source fingerprint. */
+export function analysisDraftIsStale(
+  draft: AnalysisDraft,
+  context: { projectRevision: number; fingerprint: string; providerId: string },
+) {
+  return (
+    draft.baseRevision !== null &&
+    (draft.baseRevision !== context.projectRevision ||
+      draft.baseFingerprint !== context.fingerprint ||
+      draft.providerId !== context.providerId)
+  );
+}
 
 export function analysisDraftKey(
   projectId: string,
