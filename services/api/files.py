@@ -559,35 +559,48 @@ async def upload(ident:str,file:UploadFile=File(...),directory:str='uploads',ove
         backup.unlink(missing_ok=True)
     return {'path':relative,'size':total,'origin':'user_import'}
 
+def _portable_config(config):
+    # Run settings recur inside historical control intents, not just live runs.
+    if isinstance(config,dict):
+        return {key:_portable_config(value) for key,value in config.items()
+                if key not in ('provider_snapshot', 'credential_ref', 'env')}
+    if isinstance(config,list):
+        return [_portable_config(item) for item in config]
+    return config
+
+
 def project_export(s,p,selection=None):
     root=project_dir(p.id); out=io.BytesIO(); project=asdict(p); project.pop('graph_meta',None)
-    project['config']={k:v for k,v in project.get('config',{}).items() if k!='host_id'}
+    project['config']={k:v for k,v in _portable_config(project.get('config',{})).items() if k!='host_id'}
     graph=graph_from_db(s,p); graph.pop('_history',None)
+    for entry in (*graph['nodes'], *graph['branches']):
+        if isinstance(entry.get('config'),dict):
+            entry['config']=_portable_config(entry['config'])
     resources={k:[asdict(r) for r in s.scalars(select(m).where(m.project_id==p.id))] for k,m in RESOURCE_MODELS.items()}
     papers=[asdict(r) for r in s.scalars(select(PaperDocument).where(PaperDocument.project_id==p.id))]
     runs=[]
     for r in s.scalars(select(TaskRun).where(TaskRun.project_id==p.id)):
-        value=asdict(r); value['config']={k:v for k,v in value['config'].items() if k not in ('provider_snapshot','credential_ref')}; value['pid']=None; value['worker_id']=None; runs.append(value)
+        value=asdict(r); value['config']=_portable_config(value['config']); value['pid']=None; value['worker_id']=None; runs.append(value)
     from services.interventions.history import export_history
     from services.research_evolution.history import export_evolution
     from services.interventions.origin_history import export_origins
     payload={'format':'forest-project-v1','project':project,'graph':graph,'resources':resources,'papers':papers,'runs':runs,
              'workspace_origins':export_origins(root),'workspace_origin_root':str(root.resolve()),
-             **export_history(s,p.id),**export_evolution(s,p.id)}
+             **_portable_config(export_history(s,p.id)),**export_evolution(s,p.id)}
     with zipfile.ZipFile(out,'w',zipfile.ZIP_DEFLATED) as z:
         z.writestr('forest-project.json',json.dumps(payload,ensure_ascii=False,indent=2))
         for f in root.rglob('*'):
             rel=str(f.relative_to(root))
-            if f.is_file() and not f.is_symlink() and f.name not in ('config.json','secrets.json','.env','owner-token') and not any(part.startswith('.') for part in f.relative_to(root).parts):
+            if f.is_file() and not f.is_symlink() and f.name not in ('config.json','task_config.json','secrets.json','.env','owner-token') and not any(part.startswith('.') for part in f.relative_to(root).parts):
                 if selection and not any(rel.startswith(x) for x in selection): continue
                 size=f.stat().st_size
                 if size>_EXPORT_MAX_FILE_BYTES:
                     error('EXPORT_FILE_TOO_LARGE',f'Cannot export {rel}: file exceeds 100 MiB limit',413)
                 z.write(f,'files/'+rel)
-            elif f.is_file() and not f.is_symlink() and f.name=='config.json' and not any(part.startswith('.') for part in f.relative_to(root).parts):
+            elif f.is_file() and not f.is_symlink() and f.name in ('config.json','task_config.json') and not any(part.startswith('.') for part in f.relative_to(root).parts):
                 if selection and not any(rel.startswith(x) for x in selection): continue
                 try:
-                    value=json.loads(f.read_text()); value.pop('provider_snapshot',None); value.pop('credential_ref',None); z.writestr('files/'+rel,json.dumps(value))
+                    value=_portable_config(json.loads(f.read_text())); z.writestr('files/'+rel,json.dumps(value))
                 except (ValueError,UnicodeDecodeError): pass
     return out.getvalue()
 @router.post('/api/projects/{ident}/export')
