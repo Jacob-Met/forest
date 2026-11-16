@@ -225,15 +225,55 @@ def _target(workspace: Path, directory: str) -> Path:
     return target
 
 
-def _write_manifest(path: Path, manifest: dict) -> None:
+def _write_manifest(path: Path, manifest: dict, *, durable: bool = False) -> None:
     descriptor, name = tempfile.mkstemp(prefix=".repository-", dir=path.parent)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
             json.dump(manifest, stream, indent=2)
             stream.write("\n")
+            if durable:
+                stream.flush()
+                os.fsync(stream.fileno())
         Path(name).replace(path)
+        if durable and os.name == "posix":
+            folder = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(folder)
+            finally:
+                os.close(folder)
     finally:
         Path(name).unlink(missing_ok=True)
+
+
+def _recover_published_source(target: Path, expected: dict) -> dict:
+    """Receive only a checkout whose own .git metadata was sealed before rename.
+
+    An unrelated directory or a modified/retargeted checkout is not a valid
+    replacement for the missing run receipt. Never remove or reset its files.
+    """
+    marker = target / ".git" / "forest-source-publication.json"
+    try:
+        if (not target.is_dir() or not (target / ".git").is_dir()
+                or (target / ".git").is_symlink() or marker.is_symlink()
+                or marker.stat().st_size > 8192):
+            raise ValueError
+        manifest = json.loads(marker.read_text(encoding="utf-8"))
+        if (not isinstance(manifest, dict) or set(manifest) != {*expected, "commit"}
+                or any(manifest.get(key) != value for key, value in expected.items())
+                or not isinstance(manifest.get("commit"), str)
+                or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", manifest["commit"])):
+            raise ValueError
+        with tempfile.TemporaryDirectory(prefix="forest-git-") as auth:
+            env = _git_environment(Path(auth), None)
+            if (_git(["rev-parse", "--verify", "HEAD^{commit}"], target, env) != manifest["commit"]
+                    or _git(["remote", "get-url", "origin"], target, env) != expected["url"]
+                    or _git(["status", "--porcelain", "--untracked-files=all"], target, env)):
+                raise ValueError
+        return manifest
+    except (OSError, UnicodeError, ValueError, RepositoryError):
+        raise RepositoryError(
+            "Repository directory is occupied without a recoverable source receipt; existing files were preserved.",
+            "REPOSITORY_DIRECTORY_OCCUPIED") from None
 
 
 def prepare_repository(spec: dict, workspace: Path, output: Path) -> dict:
@@ -252,6 +292,11 @@ def prepare_repository(spec: dict, workspace: Path, output: Path) -> dict:
             if manifest_path.stat().st_size > 8192:
                 raise ValueError
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            # The source and its internal publication marker were renamed as
+            # one directory; the outer receipt can be restored after a crash.
+            manifest = _recover_published_source(target, expected)
+            _write_manifest(manifest_path, manifest)
         except (OSError, UnicodeError, ValueError):
             raise RepositoryError("Repository directory is occupied without a matching source receipt; existing files were preserved.", "REPOSITORY_DIRECTORY_OCCUPIED") from None
         if (not isinstance(manifest, dict) or set(manifest) != {*expected, "commit"} or
@@ -285,6 +330,10 @@ def prepare_repository(spec: dict, workspace: Path, output: Path) -> dict:
         _git(["config", "core.hooksPath", os.devnull], staged, env)
         _git(["config", "submodule.recurse", "false"], staged, env)
         _git(["remote", "set-url", "origin", spec["url"]], staged, env)
+        manifest = {**expected, "commit": commit}
+        # Seal the source identity *inside* the directory that is published by
+        # one rename. The separate run receipt can then be repaired on restart.
+        _write_manifest(staged / ".git" / "forest-source-publication.json", manifest, durable=True)
         if target.exists() or target.is_symlink():
             raise RepositoryError("Repository directory became occupied; existing files were preserved.", "REPOSITORY_DIRECTORY_OCCUPIED")
         try:
@@ -301,6 +350,5 @@ def prepare_repository(spec: dict, workspace: Path, output: Path) -> dict:
             except OSError:
                 pass
             raise RepositoryError("Unable to publish the prepared checkout; existing files were preserved.", "REPOSITORY_DIRECTORY_OCCUPIED") from None
-    manifest = {**expected, "commit": commit}
     _write_manifest(manifest_path, manifest)
     return manifest
