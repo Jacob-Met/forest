@@ -482,6 +482,51 @@ def scenario():
     assert resolve(fresh).availability=='changed'
     print(json.dumps({'status':'PASS','backend':settings.database_url.split(':')[0],'cases':['empty','history','scope separation','UTF-8 source','same-stat edit','editor conflict','symlink','deletion','job coalescing','atomic claim','failure isolation','owner access','restore']}))
 
+def test_wide_project_inventory_eventually_observes_every_directory(tmp_path):
+    """A capped scan must resume past 2,048 siblings instead of starving the tail."""
+    program = r"""
+from sqlalchemy import select, func
+from fastapi.testclient import TestClient
+from services.api.db import migrate, Session
+from services.api.main import app
+from services.api.common import project_dir
+from services.observation.files import sync_scopes, reconcile
+from services.observation.models import ObservationScope, ObservedFile
+migrate()
+with TestClient(app) as client:
+    created = client.post('/api/projects', json={'name': 'Wide observation tree'})
+    assert created.status_code == 200, created.text
+    project_id = created.json()['id']
+root = project_dir(project_id)
+for index in range(2055):
+    folder = root / f'observed-{index:04}'
+    folder.mkdir()
+    (folder / 'marker.txt').write_text(str(index))
+with Session.begin() as session:
+    sync_scopes(session, project_id)
+    session.flush()
+    scope = session.scalar(select(ObservationScope).where(
+        ObservationScope.project_id == project_id, ObservationScope.kind == 'project'))
+    scope_id = scope.id
+for attempt in range(35):
+    reconcile(scope_id)
+    with Session() as session:
+        scope = session.get(ObservationScope, scope_id)
+        observed = session.scalar(select(func.count()).select_from(ObservedFile).where(
+            ObservedFile.scope_id == scope_id, ObservedFile.state != 'deleted'))
+        if scope.coverage == 'complete':
+            break
+assert (observed, scope.coverage, scope.error) == (2055, 'complete', None), (
+    observed, scope.coverage, scope.error, attempt, scope.scan_generation)
+"""
+    env = {**os.environ, 'FOREST_DATA_DIR': str(tmp_path / 'data'),
+           'FOREST_DATABASE_URL': 'sqlite:///' + str(tmp_path / 'wide.sqlite'),
+           'FOREST_OWNER_TOKEN': 'wide-observation-test', 'PYTHONPATH': str(ROOT)}
+    result = subprocess.run([sys.executable, '-c', program], cwd=ROOT,
+                            env=env, capture_output=True, text=True, timeout=110)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 @pytest.mark.parametrize('backend',['sqlite','postgresql'])
 def test_real_database_scenarios(tmp_path,backend):
     env={**os.environ,'FOREST_DATA_DIR':str(tmp_path/'data'),'FOREST_MODEL':'','FOREST_OWNER_TOKEN':'observation-test-owner','PYTHONPATH':str(ROOT)}
