@@ -501,7 +501,7 @@ def system():
     provider_status=[provider_health(p) for p in providers]
     verified_model=any(p['available'] and provider.kind!='codex_cli' for p,provider in zip(provider_status,providers))
     codex_cli_signed_in=any(p['available'] and provider.kind=='codex_cli' for p,provider in zip(provider_status,providers))
-    return {'cpu_percent':psutil.cpu_percent(),'memory':{'total':vm.total,'used':vm.used,'percent':vm.percent},'disk':{'total':disk.total,'used':disk.used,'free':disk.free},'gpu':gpu,'workers':workers,'latex':shutil.which('tectonic') or shutil.which('pdflatex'),'model_connected':verified_model,'model_check_pending':codex_cli_signed_in and not verified_model,'provider_status':provider_status,'platform':os.uname().sysname,'isolation':'trusted_local_process'}
+    return {'cpu_percent':psutil.cpu_percent(),'memory':{'total':vm.total,'used':vm.used,'percent':vm.percent},'disk':{'total':disk.total,'used':disk.used,'free':disk.free},'gpu':gpu,'workers':workers,'latex':(shutil.which('tectonic') or shutil.which('pdflatex')) if shutil.which('bwrap') else None,'model_connected':verified_model,'model_check_pending':codex_cli_signed_in and not verified_model,'provider_status':provider_status,'platform':os.uname().sysname,'isolation':'trusted_local_process'}
 DEFAULT_SETTINGS = {'language':'en','theme':'light','retention_days':30,'default_mode':'assisted'}
 
 @app.get('/api/settings')
