@@ -195,22 +195,62 @@ class ContainerRunner:
                 raise RuntimeError('Container log read failed: ' + spool.read(3000).decode(errors='replace'))
             spool.seek(0)
             text, size, duplicate = [], 0, 0
+            maximum = min(max(int(limit), 1), 1_000_000)
             next_cursor = dict(cursor)
             for raw in spool:
+                if size >= maximum:
+                    break
                 stamp, _, payload = raw.partition(b' ')
                 timestamp = stamp.decode(errors='replace')
-                if timestamp == cursor.get('timestamp'):
+                old_timestamp = timestamp == cursor.get('timestamp')
+                if old_timestamp:
                     duplicate += 1
                     if duplicate <= cursor.get('same_timestamp_lines', 0):
                         continue
-                if timestamp == next_cursor.get('timestamp'):
-                    next_cursor['same_timestamp_lines'] = next_cursor.get('same_timestamp_lines', 0) + 1
+                # A cursor counts complete records at a timestamp, plus the
+                # number of decoded characters already delivered from the next
+                # record. Decoding first makes both UTF-8 and malformed byte
+                # replacement stable across Docker --since replay.
+                start = (int(cursor.get('partial_chars') or 0)
+                    if old_timestamp and duplicate == cursor.get('same_timestamp_lines', 0) + 1
+                    else 0)
+                body = payload.decode(errors='replace')
+                if start < 0 or start > len(body):
+                    raise ValueError('Stored container log cursor is outside its original record')
+                remaining = maximum - size
+                segment = body[start:start + remaining]
+                encoded_size = len(segment.encode('utf-8'))
+                if encoded_size > remaining:
+                    # Binary search the largest whole-character prefix that
+                    # fits the *encoded* byte budget, not the character count.
+                    low, high = 0, len(segment)
+                    while low < high:
+                        midpoint = (low + high + 1) // 2
+                        if len(segment[:midpoint].encode('utf-8')) <= remaining:
+                            low = midpoint
+                        else:
+                            high = midpoint - 1
+                    segment = segment[:low]
+                    encoded_size = len(segment.encode('utf-8'))
+                if not segment and start < len(body):
+                    if size:
+                        break
+                    raise ValueError(
+                        f'Container log byte limit {maximum} cannot hold the next '
+                        f'{len(body[start].encode("utf-8"))}-byte UTF-8 character')
+                size += encoded_size
+                text.append(segment)
+                full_line = start + len(segment) == len(body)
+                finished = (next_cursor.get('same_timestamp_lines', 0)
+                    if timestamp == next_cursor.get('timestamp') else 0)
+                if full_line:
+                    next_cursor = {'timestamp': timestamp,
+                                   'same_timestamp_lines': finished + 1}
                 else:
-                    next_cursor = {'timestamp': timestamp, 'same_timestamp_lines': 1}
-                text.append(payload.decode(errors='replace'))
-                size += len(payload)
-                if size >= min(max(int(limit), 1), 1_000_000):
-                    break
+                    next_cursor = {'timestamp': timestamp,
+                                   'same_timestamp_lines': finished,
+                                   'partial_chars': start + len(segment)}
+                    break  # The remainder of this record is still unread.
         return {'text': ''.join(text), 'cursor': next_cursor}
 
     def stop(self, job, grace=5):

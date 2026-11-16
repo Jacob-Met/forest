@@ -521,3 +521,95 @@ def test_container_log_timeout_does_not_abandon_running_task(tmp_path, monkeypat
         assert failed.value.wait_for['type'] == 'execution_reconciliation'
         assert failed.value.wait_for['container_task'] == job['task_id']
     assert actions == ['read', 'stop']
+
+
+def test_container_log_cursor_replays_long_same_timestamp_records_without_overrun(monkeypatch):
+    from runners.container import ContainerRunner
+    runner=ContainerRunner({});runner.docker='docker'
+    monkeypatch.setattr(runner,'_verified',lambda job:{'Id':job['container_id']})
+    old='2026-11-16T00:00:00.000000000Z'
+    later='2026-11-16T00:00:01.000000000Z'
+    records=[(old,'A'*233+'\n'),(old,'B'*51+'\n'),(later,'C'*41+'\n')]
+    payload=''.join(stamp+' '+body for stamp,body in records).encode()
+    expected=''.join(body for _,body in records)
+    snapshots=[]
+
+    def docker_run(args, *, stdout, stderr, timeout):
+        assert args[:3]==['docker','logs','--timestamps']
+        since=args[args.index('--since')+1] if '--since' in args else ''
+        stdout.write(b''.join(line for line in payload.splitlines(keepends=True)
+            if line.split(b' ',1)[0].decode()>=since))
+        snapshots.append(since)
+        return subprocess.CompletedProcess(args,0)
+
+    monkeypatch.setattr('runners.container.subprocess.run', docker_run)
+    cursor=None; portions=[]
+    for _ in range(20):
+        response=runner.output({'container_id':'correct-container'},cursor,limit=37)
+        chunk=response['text']
+        assert len(chunk.encode('utf-8'))<=37
+        if not chunk: break
+        portions.append(chunk)
+        cursor=response['cursor']
+    else:
+        raise AssertionError('Cursor never reached the end of the records')
+    assert ''.join(portions)==expected
+    assert cursor['timestamp']==later and cursor['same_timestamp_lines']==1
+    assert len(snapshots)>=7
+
+
+@pytest.mark.parametrize('body,limit', [
+    ('😀漢字é'*9+'\n', 9),
+    ('a\ufffdb\n', 4),
+])
+def test_container_log_cursor_preserves_utf8_text_below_byte_limit(monkeypatch,body,limit):
+    from runners.container import ContainerRunner
+    runner=ContainerRunner({});runner.docker='docker'
+    monkeypatch.setattr(runner,'_verified',lambda job:{'Id':job['container_id']})
+    record=b'2026-11-16T00:00:00.000000000Z '+body.encode('utf-8')
+    def docker_run(args, *, stdout, stderr, timeout):
+        stdout.write(record)
+        return subprocess.CompletedProcess(args,0)
+    monkeypatch.setattr('runners.container.subprocess.run', docker_run)
+    cursor=None;collected=''
+    for _ in range(50):
+        chunk=runner.output({'container_id':'same'},cursor,limit=limit)
+        assert len(chunk['text'].encode('utf-8'))<=limit
+        if not chunk['text']: break
+        collected+=chunk['text']
+        cursor=chunk['cursor']
+    else:raise AssertionError('Partial UTF-8 cursor failed to advance')
+    assert collected==body
+
+
+def test_container_log_single_megabyte_record_never_escapes_small_byte_budget(monkeypatch):
+    from runners.container import ContainerRunner
+    runner=ContainerRunner({});runner.docker='docker'
+    monkeypatch.setattr(runner,'_verified',lambda job:{'Id':job['container_id']})
+    record=b'2026-11-16T00:00:00.000000000Z '+b'Z'*1_500_000+b'\n'
+    def docker_run(args, *, stdout, stderr, timeout):
+        stdout.write(record)
+        return subprocess.CompletedProcess(args,0)
+    monkeypatch.setattr('runners.container.subprocess.run', docker_run)
+    first=runner.output({'container_id':'megabyte'},limit=100)
+    second=runner.output({'container_id':'megabyte'},first['cursor'],limit=100)
+    assert first['text']==second['text']=='Z'*100
+    assert second['cursor']['same_timestamp_lines']==0
+    assert second['cursor']['partial_chars']==200
+
+
+def test_container_log_cursor_rejects_impossible_character_budget_and_stale_offset(monkeypatch):
+    from runners.container import ContainerRunner
+    runner=ContainerRunner({}); runner.docker='docker'
+    monkeypatch.setattr(runner,'_verified',lambda job:{'Id':job['container_id']})
+    timestamp='2026-11-16T00:00:00.000000000Z'
+    record=(timestamp+' 😀\n').encode('utf-8')
+    def docker_run(args, *, stdout, stderr, timeout):
+        stdout.write(record)
+        return subprocess.CompletedProcess(args,0)
+    monkeypatch.setattr('runners.container.subprocess.run',docker_run)
+    with pytest.raises(ValueError,match='cannot hold the next 4-byte'):
+        runner.output({'container_id':'one'},limit=1)
+    with pytest.raises(ValueError,match='outside its original record'):
+        runner.output({'container_id':'one'},{'timestamp':timestamp,
+            'same_timestamp_lines':0,'partial_chars':123},limit=100)
