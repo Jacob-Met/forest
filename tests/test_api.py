@@ -876,6 +876,44 @@ def case_export_import_reference_roundtrip(client, app):
     assert ok(client.get(f"/api/runs/{new_runs[0]['id']}/output"))["text"] == "actual saved output\n"
 
 
+def case_export_omits_task_environment_secrets(client, app):
+    project = create(client)
+    sentinel = "EXPORT_SECRET_SENTINEL"
+    node = add_node(client, project, config={
+        "kind": "command", "command": ["python", "-c", "pass"],
+        "env": {"PROBE_TOKEN": sentinel}, "timeout": 19,
+    })
+    run = ok(client.post(f"/api/nodes/{node['id']}/run", json={"request_id": "export-secret-probe"}))
+    root = Path(os.environ["FOREST_DATA_DIR"]) / "projects" / project["id"]
+    config_file = root / "portable-config" / "config.json"
+    config_file.parent.mkdir()
+    config_file.write_text(json.dumps({"env": {"PROBE_TOKEN": sentinel},
+                                      "provider_snapshot": {"key": sentinel},
+                                      "keep": "safe portable setting"}))
+    task_config_path = root / run["output_path"] / "task_config.json"
+    task_config_path.parent.mkdir(parents=True, exist_ok=True)
+    task_config_path.write_text(json.dumps({"env": {"PROBE_TOKEN": sentinel},
+                                           "timeout": 19, "kind": "command"}))
+
+    response = client.post(f"/api/projects/{project['id']}/export", json={})
+    assert response.status_code == 200, response.text
+    with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+        manifest = json.loads(archive.read("forest-project.json"))
+        portable_config = json.loads(archive.read("files/portable-config/config.json"))
+        portable_task_config = json.loads(archive.read(
+            f"files/{run['output_path']}/task_config.json"))
+        assert sentinel.encode() not in archive.read("forest-project.json")
+        assert sentinel.encode() not in archive.read("files/portable-config/config.json")
+        assert sentinel.encode() not in archive.read(f"files/{run['output_path']}/task_config.json")
+    exported_run = next(item for item in manifest["runs"] if item["id"] == run["id"])
+    assert "env" not in exported_run["config"]
+    assert exported_run["config"]["timeout"] == 19
+    assert "env" not in manifest["graph"]["nodes"][0]["config"]
+    assert manifest["graph"]["nodes"][0]["config"]["timeout"] == 19
+    assert portable_config == {"keep": "safe portable setting"}
+    assert portable_task_config == {"timeout": 19, "kind": "command"}
+
+
 def case_export_rejects_oversized_files_and_keeps_boundary_roundtrip(client, app):
     p = create(client)
     root = Path(os.environ["FOREST_DATA_DIR"]) / "projects" / p["id"]
