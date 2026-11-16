@@ -30,8 +30,11 @@ def import_library(body:dict=Body(...)):
     if isinstance(paper,list): rows=paper
     else: rows=[paper]
     saved=[]
+    from services.worker.scheduler import _lock_project
     with Session.begin() as s:
-        get(s,Project,pid)
+        # Share the project writer lock with Agent imports and Library edits:
+        # deduplication must observe the most recently committed source.
+        _lock_project(s,pid)
         for paper in rows:
             old=next((r for r in s.scalars(select(SourcePaper).where(SourcePaper.project_id==pid))
                       if matches_publication(paper,r.data,r.title)),None)

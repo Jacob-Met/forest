@@ -47,6 +47,8 @@ export function LibraryPage() {
   const [selected, setSelected] = useState<RecordItem | null>(null);
   const [editing, setEditing] = useState<RecordItem | null>(null);
   const [identifier, setIdentifier] = useState("");
+  const [identifierImporting, setIdentifierImporting] = useState(false);
+  const identifierImportLock = useRef(false);
   const [webUrl, setWebUrl] = useState("");
   const [webScreenshot, setWebScreenshot] = useState(false);
   const [webResult, setWebResult] = useState<Json | null>(null);
@@ -135,15 +137,24 @@ export function LibraryPage() {
             placeholder="DOI / arXiv ID / URL"
           />
           <Button
-            disabled={!identifier.trim()}
+            disabled={!identifier.trim() || identifierImporting}
+            busy={identifierImporting}
             onClick={() =>
               action(async () => {
-                await api("/library/import", "POST", {
-                  project_id: id,
-                  identifier,
-                });
-                setIdentifier("");
-                await reload();
+                if (identifierImportLock.current) return;
+                identifierImportLock.current = true;
+                setIdentifierImporting(true);
+                try {
+                  await api("/library/import", "POST", {
+                    project_id: id,
+                    identifier,
+                  });
+                  setIdentifier("");
+                  await reload();
+                } finally {
+                  identifierImportLock.current = false;
+                  setIdentifierImporting(false);
+                }
               })
             }
           >
