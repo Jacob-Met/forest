@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import io
+import hashlib
 import os
 from pathlib import Path
 import re
@@ -160,6 +161,18 @@ def compile_paper(directory, source_name="paper.tex", timeout=180, *, repair_lay
     source = (directory / source_name).resolve()
     if source.parent != directory or source.suffix != ".tex" or source.name.startswith("-") or not source.is_file():
         raise ValueError("Compile a .tex source in the paper directory")
+    # Capture the exact bytes passed into compilation, not only their paths.
+    # A later review timestamp cannot establish that a PDF belongs to the
+    # current manuscript. Keep these hashes on the completed run receipt.
+    def digest(path):
+        if not path.is_file():
+            return None
+        with path.open('rb') as stream:
+            return hashlib.file_digest(stream, 'sha256').hexdigest()
+
+    bibliography = directory / 'references.bib'
+    source_digest = digest(source)
+    bibliography_digest = digest(bibliography)
     tectonic, pdflatex = shutil.which("tectonic"), shutil.which("pdflatex")
     logs = []
     if tectonic:
@@ -208,6 +221,17 @@ def compile_paper(directory, source_name="paper.tex", timeout=180, *, repair_lay
     (directory / "compile.log").write_text(log)
     errors = [{"line": int(match.group(1)), "message": match.group(2).strip()} for match in re.finditer(r"(?:\.tex:|^l\.)(\d+)[: ]\s*(.*)", log, re.M)]
     success = exit_code == 0 and pdf.is_file()
+    # A concurrent edit during a long TeX invocation invalidates the output.
+    if success and (digest(source) != source_digest or digest(bibliography) != bibliography_digest):
+        success = False
+        pdf.unlink(missing_ok=True)
+        logs.append('Manuscript inputs changed during compilation; recompile the current source.')
+        log = '\n'.join(logs)
+        (directory / 'compile.log').write_text(log)
+        exit_code = 1
+    provenance = ({'source_sha256': source_digest,
+                   'references_bib_sha256': bibliography_digest,
+                   'pdf_sha256': digest(pdf)} if success else None)
     report = compile_preflight(directory, source_name, success, log)
     if repair_layout and success and _layout_attempt <= 3:
         distant = [item for item in report.get('visual_placements', [])
@@ -241,6 +265,7 @@ def compile_paper(directory, source_name="paper.tex", timeout=180, *, repair_lay
             result['layout_repair_history'] = str(history)
             return result
     return {"status": "completed" if success else "failed", "exit_code": exit_code, "pdf_path": str(pdf) if success else None, "log": log, "log_path": str(directory / "compile.log"), "errors": errors,
+            "compilation_provenance": provenance,
             "preflight": report, "preflight_path": str(directory / 'layout_preflight.json')}
 
 

@@ -552,6 +552,12 @@ def case_agent_workspace_compile_publishes_actual_bundle_and_exports(client):
     (directory / 'main.tex').write_text('This later edit is not a LaTeX manuscript.')
     receipt = execute_compilation(compilation)
     assert receipt['actual_compilation'] and receipt['source_scope'] == 'workspace'
+    from hashlib import sha256
+    project_root = project_dir(pid)
+    assert receipt['compilation_provenance']['source_sha256'] == sha256(
+        (project_root / receipt['paper_source']).read_bytes()).hexdigest()
+    assert receipt['compilation_provenance']['pdf_sha256'] == sha256(
+        (project_root / receipt['pdf_path']).read_bytes()).hexdigest()
     assert receipt['origin_agent_run_id'] == run.id and receipt['publication'] == 'applied'
     paper = ok(client.get('/api/papers/' + pid))
     assert paper['revision'] == previous['revision'] + 1 == receipt['paper_revision']

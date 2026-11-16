@@ -20,6 +20,61 @@ from types import SimpleNamespace
 ROOT=Path(__file__).resolve().parents[1]
 
 
+def test_submission_requires_current_compiled_source_pdf_and_bibliography(tmp_path):
+    """A completed real TeX run cannot authorize bytes edited after compilation."""
+    import hashlib
+    import shutil
+    from research.paper.manuscript import compile_paper
+
+    if not (shutil.which('pdflatex') or shutil.which('tectonic')) or not shutil.which('bwrap'):
+        pytest.skip('Actual sandboxed TeX compiler required')
+    manuscript = tmp_path / 'papers'
+    manuscript.mkdir()
+    source = manuscript / 'paper.tex'
+    source.write_text('\\documentclass{article}\n\\begin{document}Original manuscript.\\end{document}\n')
+    bib = manuscript / 'references.bib'
+    bib.write_text('% Original references')
+    result = compile_paper(manuscript)
+    assert result['status'] == 'completed', result['log']
+    pdf = manuscript / 'paper.pdf'
+    fingerprint = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+    provenance = {'source_sha256': fingerprint(source), 'pdf_sha256': fingerprint(pdf),
+                  'references_bib_sha256': fingerprint(bib)}
+    assert result['compilation_provenance'] == provenance
+    receipt = tmp_path / 'runs' / 'compiled' / 'result.json'
+    receipt.parent.mkdir(parents=True)
+    receipt.write_text(json.dumps({'status': 'completed', 'exit_code': 0}))
+    run = {'id': 'compiled', 'kind': 'paper_compile', 'status': 'completed',
+           'output_path': 'runs/compiled', 'metrics': {
+               'paper_source': 'papers/paper.tex', 'pdf_path': 'papers/paper.pdf',
+               'compilation_provenance': provenance}}
+    manifest = {'target_venue': 'Actual local manuscript compilation', 'candidate': 'candidate',
+                'central_claim': 'The current PDF corresponds to the current source.',
+                'manuscript': {'compile_run_id': 'compiled', 'source_path': 'papers/paper.tex',
+                               'pdf_path': 'papers/paper.pdf', 'layout_report': 'papers/layout_preflight.json'}}
+
+    def fingerprint_gap():
+        report = assess_submission(tmp_path, runs=[run], manifest=manifest)
+        return [gap['finding'] for gap in report['gaps'] if gap['code'] == 'compiled_manuscript'
+                and 'since compilation' in gap['finding']]
+
+    assert fingerprint_gap() == [], 'Exact current artifacts must not be marked stale'
+    for path, failure in ((source, 'Manuscript source changed since compilation'),
+                          (pdf, 'Manuscript PDF changed since compilation'),
+                          (bib, 'Bibliography changed since compilation')):
+        original = path.read_bytes()
+        old_stat = path.stat()
+        path.write_bytes(original + b'\nEdited after the completed run.')
+        os.utime(path, ns=(old_stat.st_atime_ns, old_stat.st_mtime_ns))
+        assert any(failure in finding for finding in fingerprint_gap()), (path, fingerprint_gap())
+        path.write_bytes(original)
+
+    run['metrics'].pop('compilation_provenance')
+    report = assess_submission(tmp_path, runs=[run], manifest=manifest)
+    assert any(gap['code'] == 'compiled_manuscript' and 'recompile' in gap['finding'].lower()
+               for gap in report['gaps']), 'Unfingerprinted historical runs cannot prove current compilation'
+
+
 def test_full_submission_is_default_and_budgets_never_shrink_it():
     profile=publication_profile({'budget':{'seconds':1,'cost':.01}})
     assert profile['id']=='full_submission' and profile['manuscript_type']=='full_paper'
