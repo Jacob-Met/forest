@@ -898,6 +898,8 @@ def case_export_omits_task_environment_secrets(client, app):
     response = client.post(f"/api/projects/{project['id']}/export", json={})
     assert response.status_code == 200, response.text
     with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+        for name in archive.namelist():
+            assert sentinel.encode() not in archive.read(name), f"secret leaked to {name}"
         manifest = json.loads(archive.read("forest-project.json"))
         portable_config = json.loads(archive.read("files/portable-config/config.json"))
         portable_task_config = json.loads(archive.read(
