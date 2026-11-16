@@ -84,10 +84,19 @@ def import_source(project_id,workspace,arguments,action_id):
             destination=folder/'fulltext.pdf';shutil.copyfile(path,destination);path=destination.resolve()
         record['pdf_path']=str(path.relative_to(root.resolve()))
     record={**record,'origin_action_id':action_id,'trusted_instructions':False}
+    from services.worker.scheduler import _lock_project
     with Session.begin() as session:
-        source=next((candidate for candidate in session.scalars(
-            select(SourcePaper).where(SourcePaper.project_id==project_id)
-        ) if matches_publication(record,candidate.data,candidate.title)),None)
+        # The fast pre-import replay lookup is advisory: another import can
+        # commit while we download source material. Recheck inside the same
+        # lock as browser imports before choosing a source or adding passages.
+        _lock_project(session,project_id)
+        candidates=list(session.scalars(select(SourcePaper).where(
+            SourcePaper.project_id==project_id)))
+        for candidate in candidates:
+            if candidate.data.get('origin_action_id')==action_id:
+                return {'source':asdict(candidate),'replayed':True,'exit_code':0}
+        source=next((candidate for candidate in candidates
+                     if matches_publication(record,candidate.data,candidate.title)),None)
         if source is None:
             source=SourcePaper(project_id=project_id,title=record['title'],data=record,status='available');session.add(source);session.flush()
         else:
