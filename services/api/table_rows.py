@@ -101,12 +101,21 @@ def _json_rows(frame):
 def _order_value(value):
     import pandas as pd
     if value is None or (not isinstance(value, (list, dict)) and pd.isna(value)):
-        return (1, None, None)
-    if isinstance(value, (int, float, bool)):
-        return (0, value, None)
+        return (1, None, None, False)
+    if isinstance(value, bool):
+        return (0, int(value), None, False)
+    if isinstance(value, int):
+        # SQLite INTEGER is signed 64-bit; UInt64 scientific columns are not.
+        # Precompute fixed-width text keys for *all* nonnegative integers so
+        # the fallback can switch to exact ordering without rounding UInt64s.
+        wide = value > 2**63 - 1
+        key = f'{value:020d}' if value >= 0 else None
+        return (0, None if wide else value, key, wide)
+    if isinstance(value, float):
+        return (0, value, None, False)
     if hasattr(value, 'isoformat'):
-        return (0, None, value.isoformat())
-    return (0, None, str(value))
+        return (0, None, value.isoformat(), False)
+    return (0, None, str(value), False)
 
 
 def table_rows(path: Path, offset: int, limit: int, filter_text: str, sort: str, descending: bool):
@@ -159,6 +168,7 @@ def table_rows(path: Path, offset: int, limit: int, filter_text: str, sort: str,
                 db.execute('PRAGMA journal_mode=OFF')
                 db.execute('PRAGMA synchronous=OFF')
                 db.execute('CREATE TABLE records (ordinal INTEGER PRIMARY KEY, missing INTEGER, number NUMERIC, text TEXT, payload TEXT)')
+                wide_integer = False
                 for frame in _typed_batches(path, kinds):
                     if filter_text:
                         matches = frame.astype(str).apply(lambda c: c.str.contains(filter_text, case=False, regex=False)).any(axis=1)
@@ -169,7 +179,8 @@ def table_rows(path: Path, offset: int, limit: int, filter_text: str, sort: str,
                     encoded = _json_rows(frame)
                     records = []
                     for value, row in zip(values, encoded):
-                        missing, number, text = _order_value(value)
+                        missing, number, text, wide = _order_value(value)
+                        wide_integer |= wide
                         records.append((total + len(records), missing, number, text, json.dumps(row, ensure_ascii=False)))
                     db.executemany('INSERT INTO records VALUES (?, ?, ?, ?, ?)', records)
                     total += len(records)
@@ -181,6 +192,8 @@ def table_rows(path: Path, offset: int, limit: int, filter_text: str, sort: str,
                     numeric = (pa.types.is_integer(arrow_type) or pa.types.is_floating(arrow_type)
                                or pa.types.is_boolean(arrow_type))
                     field = 'number' if numeric else 'text'
+                if wide_integer:
+                    field = 'text'
                 rows = [json.loads(item[0]) for item in db.execute(
                     f'SELECT payload FROM records ORDER BY missing ASC, {field} {order}, ordinal ASC LIMIT ? OFFSET ?',
                     (count, start))]

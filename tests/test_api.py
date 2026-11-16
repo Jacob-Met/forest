@@ -2142,6 +2142,11 @@ def case_table_rows_streams_complete_csv_and_parquet(client, app):
         for number in range(20_000):
             passed = '' if number % 97 == 0 else ('True' if number % 2 else 'False')
             stream.write(f'{number:06d},{number % 103},{ "needle" if number == 17_345 else "other" },{passed}\n')
+    wide_csv = directory / 'wide-integer.csv'
+    with wide_csv.open('w') as stream:
+        stream.write('value,tag\n')
+        for number in range(10_000):
+            stream.write(f'{18_446_744_073_709_540_000 + number},r{number}\n')
     parquet = directory / 'table.parquet'
     pd.DataFrame({'value': range(20_000), 'description': ['needle' if x == 17_345 else 'other' for x in range(20_000)]}).to_parquet(parquet, row_group_size=512)
     with Session.begin() as session:
@@ -2171,6 +2176,10 @@ def case_table_rows_streams_complete_csv_and_parquet(client, app):
         deep = get_rows(csv, sort='score', descending='true', offset=9000, limit=2)
         expected = sorted((i % 103 for i in range(20_000)), reverse=True)[9000:9002]
         assert deep['total'] == 20_000 and [row['score'] for row in deep['rows']] == expected, deep
+        wide = get_rows(wide_csv, sort='value', offset=9000, limit=2)
+        assert [row['value'] for row in wide['rows']] == [
+            18_446_744_073_709_549_000, 18_446_744_073_709_549_001,
+        ], wide
         page = get_rows(parquet, offset=19_998, limit=10)
         assert page['total'] == 20_000 and [row['value'] for row in page['rows']] == [19_998, 19_999], page
         matching = get_rows(parquet, filter='needle')
