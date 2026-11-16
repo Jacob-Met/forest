@@ -537,7 +537,8 @@ def rename_file(ident:str,body:dict=Body(...)):
 def download_file(ident:str,path:str):
     p=safe_path(validate_project(ident),path,True)
     if not p.is_file(): error('NOT_FILE','Choose a file')
-    return FileResponse(p,filename=p.name,content_disposition_type='inline')
+    disposition, headers = artifact_download_policy(p.name)
+    return FileResponse(p, filename=p.name, content_disposition_type=disposition, headers=headers)
 @router.post('/api/projects/{ident}/upload')
 async def upload(ident:str,file:UploadFile=File(...),directory:str='uploads',overwrite:bool=True):
     root=validate_project(ident); p=safe_path(root,directory+'/'+Path(file.filename or 'upload').name)
@@ -559,35 +560,48 @@ async def upload(ident:str,file:UploadFile=File(...),directory:str='uploads',ove
         backup.unlink(missing_ok=True)
     return {'path':relative,'size':total,'origin':'user_import'}
 
+def _portable_config(config):
+    # Run settings recur inside historical control intents, not just live runs.
+    if isinstance(config,dict):
+        return {key:_portable_config(value) for key,value in config.items()
+                if key not in ('provider_snapshot', 'credential_ref', 'env')}
+    if isinstance(config,list):
+        return [_portable_config(item) for item in config]
+    return config
+
+
 def project_export(s,p,selection=None):
     root=project_dir(p.id); out=io.BytesIO(); project=asdict(p); project.pop('graph_meta',None)
-    project['config']={k:v for k,v in project.get('config',{}).items() if k!='host_id'}
+    project['config']={k:v for k,v in _portable_config(project.get('config',{})).items() if k!='host_id'}
     graph=graph_from_db(s,p); graph.pop('_history',None)
+    for entry in (*graph['nodes'], *graph['branches']):
+        if isinstance(entry.get('config'),dict):
+            entry['config']=_portable_config(entry['config'])
     resources={k:[asdict(r) for r in s.scalars(select(m).where(m.project_id==p.id))] for k,m in RESOURCE_MODELS.items()}
     papers=[asdict(r) for r in s.scalars(select(PaperDocument).where(PaperDocument.project_id==p.id))]
     runs=[]
     for r in s.scalars(select(TaskRun).where(TaskRun.project_id==p.id)):
-        value=asdict(r); value['config']={k:v for k,v in value['config'].items() if k not in ('provider_snapshot','credential_ref')}; value['pid']=None; value['worker_id']=None; runs.append(value)
+        value=asdict(r); value['config']=_portable_config(value['config']); value['pid']=None; value['worker_id']=None; runs.append(value)
     from services.interventions.history import export_history
     from services.research_evolution.history import export_evolution
     from services.interventions.origin_history import export_origins
     payload={'format':'forest-project-v1','project':project,'graph':graph,'resources':resources,'papers':papers,'runs':runs,
              'workspace_origins':export_origins(root),'workspace_origin_root':str(root.resolve()),
-             **export_history(s,p.id),**export_evolution(s,p.id)}
+             **_portable_config(export_history(s,p.id)),**export_evolution(s,p.id)}
     with zipfile.ZipFile(out,'w',zipfile.ZIP_DEFLATED) as z:
         z.writestr('forest-project.json',json.dumps(payload,ensure_ascii=False,indent=2))
         for f in root.rglob('*'):
             rel=str(f.relative_to(root))
-            if f.is_file() and not f.is_symlink() and f.name not in ('config.json','secrets.json','.env','owner-token') and not any(part.startswith('.') for part in f.relative_to(root).parts):
+            if f.is_file() and not f.is_symlink() and f.name not in ('config.json','task_config.json','secrets.json','.env','owner-token') and not any(part.startswith('.') for part in f.relative_to(root).parts):
                 if selection and not any(rel.startswith(x) for x in selection): continue
                 size=f.stat().st_size
                 if size>_EXPORT_MAX_FILE_BYTES:
                     error('EXPORT_FILE_TOO_LARGE',f'Cannot export {rel}: file exceeds 100 MiB limit',413)
                 z.write(f,'files/'+rel)
-            elif f.is_file() and not f.is_symlink() and f.name=='config.json' and not any(part.startswith('.') for part in f.relative_to(root).parts):
+            elif f.is_file() and not f.is_symlink() and f.name in ('config.json','task_config.json') and not any(part.startswith('.') for part in f.relative_to(root).parts):
                 if selection and not any(rel.startswith(x) for x in selection): continue
                 try:
-                    value=json.loads(f.read_text()); value.pop('provider_snapshot',None); value.pop('credential_ref',None); z.writestr('files/'+rel,json.dumps(value))
+                    value=_portable_config(json.loads(f.read_text())); z.writestr('files/'+rel,json.dumps(value))
                 except (ValueError,UnicodeDecodeError): pass
     return out.getvalue()
 @router.post('/api/projects/{ident}/export')
@@ -626,6 +640,20 @@ def cleanup_project_import_on_failure():
             except FileNotFoundError:
                 pass
         raise
+
+def _untrust_imported_figure(figure):
+    """Archive code is evidence to review, never an executable task by default."""
+    if isinstance(figure, dict) and figure.get('code') and figure.get('code_origin') != 'renderer':
+        return {**figure, 'code_origin': 'imported_untrusted'}
+    return figure
+
+
+def _untrust_figure_snapshot(config):
+    # Figure code can be embedded in a graph node OR a retryable run.
+    if isinstance(config,dict) and 'figure' in config:
+        return {**config,'figure':_untrust_imported_figure(config['figure'])}
+    return config
+
 
 @router.post('/api/projects/import')
 async def import_project(file:UploadFile=File(...)):
@@ -708,8 +736,9 @@ async def import_project(file:UploadFile=File(...)):
         graph=historical_branches(remap(graph)); graph['project_id']=p.id; graph['revision']=0; graph.pop('_history',None)
         node_configs={mapping[row['id']]:row.get('config',{}) for row in manifest['graph']['nodes']}
         for node in graph['nodes']:
-            node['config']=relocate_permission_config(node_configs[node['id']],node.get('config',{}),root,
-                                                     manifest.get('workspace_origin_root'),remap)
+            node['config']=_untrust_figure_snapshot(relocate_permission_config(
+                node_configs[node['id']],node.get('config',{}),root,
+                manifest.get('workspace_origin_root'),remap))
         for node in graph['nodes']:
             if node.get('execution_status') in ('queued','running','pausing','paused','waiting_input'):
                 node['imported_execution_status']=node['execution_status']; node['execution_status']='interrupted'
@@ -727,18 +756,24 @@ async def import_project(file:UploadFile=File(...)):
         for key,rows in manifest.get('resources',{}).items():
             model=RESOURCE_MODELS.get(key)
             if model:
-                for r in rows: s.add(model(id=mapping[r['id']],project_id=p.id,title=r['title'],data=remap(r['data']),status=r['status']))
+                for r in rows:
+                    data = remap(r['data'])
+                    if model is Figure: data = _untrust_imported_figure(data)
+                    s.add(model(id=mapping[r['id']],project_id=p.id,title=r['title'],data=data,status=r['status']))
         for r in manifest.get('papers',[]): s.add(PaperDocument(id=mapping[r['id']],project_id=p.id,title=r['title'],data=remap(r['data']),status=r['status']))
         for r in manifest.get('runs',[]):
             # Imported measurements retain their original run identifiers inside source data; execution is not replayed.
             ident=mapping[r['id']]
             timestamps=run_timestamps[r['id']]
+            # Terminal imported runs can be retried and graph nodes re-launched.
+            # Preserved Python source must not regain executable authority.
+            run_config=_untrust_figure_snapshot(remap(r.get('config',{})))
             s.add(TaskRun(
                 id=ident,project_id=p.id,node_id=remap(r.get('node_id')),
                 branch_id=remap(r.get('branch_id')),request_id='import:'+ident,
                 kind=r['kind'],
                 status=r['status'] if r['status'] in ('completed','failed','cancelled') else 'interrupted',
-                config={**remap(r.get('config',{})),'origin':'imported_run','original_run_id':r['id']},
+                config={**run_config,'origin':'imported_run','original_run_id':r['id']},
                 node_revision=r.get('node_revision',0),
                 created_at=timestamps['created_at'],
                 started_at=timestamps['started_at'],

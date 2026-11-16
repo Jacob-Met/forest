@@ -5,7 +5,7 @@ import mimetypes
 from typing import Literal
 from sqlalchemy import select
 from .db import Session, Project, EventSequence, uid
-from .common import get, error
+from .common import get, error, artifact_download_policy
 from services.observation.models import ObservationState, ObservationScope, ObservedFile, ReportJob
 from services.observation.contracts import (ProjectProgressSnapshot, ScopePage, FilePage, SourceRef, SourceView,
     ReporterSettingsView, ReporterSettingsWrite, ReporterRefresh, ReporterJob, ReportPage)
@@ -70,9 +70,9 @@ def artifact(ident:str,file_id:str,epoch:str,generation:int=Query(ge=1)):
         data=row.content; path=row.path
     view=resolve(ref)
     if view.availability!='available': error('SOURCE_CHANGED','Observed artifact is changed or unavailable',409)
-    return Response(content=data,media_type=mimetypes.guess_type(path)[0] or 'application/octet-stream',
-                    headers={'Cache-Control':'no-store','Content-Disposition':'inline' if path.lower().endswith(('.pdf','.png','.jpg','.jpeg','.gif','.webp')) else 'attachment',
-                             'Content-Security-Policy':"sandbox; default-src 'none'"})
+    disposition, headers = artifact_download_policy(path)
+    return Response(content=data, media_type=mimetypes.guess_type(path)[0] or 'application/octet-stream',
+                    headers={**headers, 'Content-Disposition': disposition})
 
 @router.get('/api/projects/{ident}/reporter-settings',response_model=ReporterSettingsView)
 def reporter_settings(ident:str): return settings_view(ident)

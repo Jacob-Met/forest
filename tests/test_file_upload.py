@@ -800,6 +800,29 @@ def case_rename_and_delete_wait_for_failed_publication_recovery(client):
     assert not list(root.rglob('.forest-upload-*'))
 
 
+def case_downloads_isolate_active_document_content(client):
+    project, root, upload_endpoint = project_files(client)
+    files = [
+        ('report.html', 'text/html', b'<script>document.title="unsafe"</script>', 'attachment'),
+        ('UPPER.HTML', 'text/html', b'<script>document.title="unsafe"</script>', 'attachment'),
+        ('plot.svg', 'image/svg+xml', b'<svg xmlns="http://www.w3.org/2000"><script>alert(1)</script></svg>', 'attachment'),
+        ('payload.xhtml', 'application/xhtml+xml', b'<html></html>', 'attachment'),
+        ('notes.txt', 'text/plain', b'plain text output', 'attachment'),
+        ('figure.png', 'image/png', b'\x89PNG\r\n\x1a\n', 'inline'),
+        ('paper.pdf', 'application/pdf', b'%PDF-1.7\n', 'inline'),
+    ]
+    for name, mime, payload, disposition in files:
+        uploaded = ok(client.post(upload_endpoint, files={'file': (name, payload, mime)}))
+        result = client.get(f"/api/projects/{project['id']}/download",
+                            params={'path': uploaded['path']})
+        assert result.status_code == 200, (name, result.status_code, result.text)
+        assert result.content == payload, name
+        assert result.headers['content-disposition'].startswith(disposition + ';'), name
+        assert result.headers['content-security-policy'] == "sandbox; default-src 'none'", name
+        assert result.headers['cache-control'] == 'no-store', name
+        assert result.headers['x-content-type-options'] == 'nosniff', name
+
+
 CASES = [name.removeprefix("case_") for name in list(globals()) if name.startswith("case_")]
 
 

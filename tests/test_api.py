@@ -876,6 +876,44 @@ def case_export_import_reference_roundtrip(client, app):
     assert ok(client.get(f"/api/runs/{new_runs[0]['id']}/output"))["text"] == "actual saved output\n"
 
 
+def case_export_omits_task_environment_secrets(client, app):
+    project = create(client)
+    sentinel = "EXPORT_SECRET_SENTINEL"
+    node = add_node(client, project, config={
+        "kind": "command", "command": ["python", "-c", "pass"],
+        "env": {"PROBE_TOKEN": sentinel}, "timeout": 19,
+    })
+    run = ok(client.post(f"/api/nodes/{node['id']}/run", json={"request_id": "export-secret-probe"}))
+    root = Path(os.environ["FOREST_DATA_DIR"]) / "projects" / project["id"]
+    config_file = root / "portable-config" / "config.json"
+    config_file.parent.mkdir()
+    config_file.write_text(json.dumps({"env": {"PROBE_TOKEN": sentinel},
+                                      "provider_snapshot": {"key": sentinel},
+                                      "keep": "safe portable setting"}))
+    task_config_path = root / run["output_path"] / "task_config.json"
+    task_config_path.parent.mkdir(parents=True, exist_ok=True)
+    task_config_path.write_text(json.dumps({"env": {"PROBE_TOKEN": sentinel},
+                                           "timeout": 19, "kind": "command"}))
+
+    response = client.post(f"/api/projects/{project['id']}/export", json={})
+    assert response.status_code == 200, response.text
+    with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+        manifest = json.loads(archive.read("forest-project.json"))
+        portable_config = json.loads(archive.read("files/portable-config/config.json"))
+        portable_task_config = json.loads(archive.read(
+            f"files/{run['output_path']}/task_config.json"))
+        assert sentinel.encode() not in archive.read("forest-project.json")
+        assert sentinel.encode() not in archive.read("files/portable-config/config.json")
+        assert sentinel.encode() not in archive.read(f"files/{run['output_path']}/task_config.json")
+    exported_run = next(item for item in manifest["runs"] if item["id"] == run["id"])
+    assert "env" not in exported_run["config"]
+    assert exported_run["config"]["timeout"] == 19
+    assert "env" not in manifest["graph"]["nodes"][0]["config"]
+    assert manifest["graph"]["nodes"][0]["config"]["timeout"] == 19
+    assert portable_config == {"keep": "safe portable setting"}
+    assert portable_task_config == {"timeout": 19, "kind": "command"}
+
+
 def case_export_rejects_oversized_files_and_keeps_boundary_roundtrip(client, app):
     p = create(client)
     root = Path(os.environ["FOREST_DATA_DIR"]) / "projects" / p["id"]
@@ -1287,6 +1325,264 @@ def case_visitors_shares_and_origin_denial(client, app):
     assert client.post("/api/projects", json={"name": "CSRF"}, headers={"origin": "https://evil.example"}).status_code == 403
     ok(client.delete("/api/shares/" + share["token"]))
     assert client.get("/api/shares/" + share["token"]).status_code == 404
+
+
+def case_concurrent_provider_credential_changes(client, app):
+    """Two simultaneous writes must preserve every committed provider credential."""
+    import threading
+    from unittest.mock import patch
+    from services.api.db import Provider, Session
+    from services.api.common import read_secret
+
+    secrets_path = Path(os.environ["FOREST_DATA_DIR"]) / "secrets.json"
+    secrets_path.write_text("{}")
+    secrets_path.chmod(0o600)
+
+    def parallel_with_collision(requests):
+        # Make both writers read the same initial snapshot on the broken
+        # implementation. With a proper cross-thread lock, the first read
+        # times out and the second observes the first committed change.
+        barrier = threading.Barrier(2)
+        original = Path.read_text
+        entered = 0
+        counter_lock = threading.Lock()
+
+        def synchronized_read(path, *args, **kwargs):
+            nonlocal entered
+            data = original(path, *args, **kwargs)
+            if path == secrets_path:
+                with counter_lock:
+                    entered += 1
+                    should_wait = entered <= 2
+                if should_wait:
+                    try:
+                        barrier.wait(timeout=0.35)
+                    except threading.BrokenBarrierError:
+                        pass
+            return data
+
+        with patch.object(Path, "read_text", synchronized_read):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                return list(pool.map(lambda request: request(), requests))
+
+    def create_provider(name, key):
+        return client.post("/api/providers", json={
+            "name": name, "kind": "openai",
+            "base_url": "http://127.0.0.1:12345/v1",
+            "model": "dummy", "api_key": key,
+        })
+
+    created = parallel_with_collision([
+        lambda: create_provider("Concurrent A", "DUMMY-KEY-A"),
+        lambda: create_provider("Concurrent B", "DUMMY-KEY-B"),
+    ])
+    providers = [ok(response) for response in created]
+    ids = [provider["id"] for provider in providers]
+
+    def assert_credentials(expected):
+        with Session() as session:
+            for ident, key in expected.items():
+                provider = session.get(Provider, ident)
+                assert provider.credential_ref
+                assert read_secret(provider.credential_ref) == key
+
+    assert_credentials(dict(zip(ids, ("DUMMY-KEY-A", "DUMMY-KEY-B"))))
+
+    updated = parallel_with_collision([
+        lambda: client.patch(f"/api/providers/{ids[0]}", json={"api_key": "NEW-DUMMY-A"}),
+        lambda: client.patch(f"/api/providers/{ids[1]}", json={"api_key": "NEW-DUMMY-B"}),
+    ])
+    for response in updated:
+        ok(response)
+    assert_credentials(dict(zip(ids, ("NEW-DUMMY-A", "NEW-DUMMY-B"))))
+
+    survivor = ok(create_provider("Unchanged provider", "DUMMY-SURVIVOR"))
+    retired = parallel_with_collision([
+        lambda: client.post(f"/api/providers/{ids[0]}/retire", json={}),
+        lambda: client.post(f"/api/providers/{ids[1]}/retire", json={}),
+    ])
+    for response in retired:
+        ok(response)
+    assert_credentials({survivor["id"]: "DUMMY-SURVIVOR"})
+    with Session() as session:
+        assert all(session.get(Provider, ident).credential_ref is None for ident in ids)
+    assert list(json.loads(secrets_path.read_text()).values()) == ["DUMMY-SURVIVOR"]
+
+
+def case_cross_process_secret_mutations(client, app):
+    """Separate API workers share a credential store without lost keys."""
+    import time
+
+    secret_path = Path(os.environ["FOREST_DATA_DIR"]) / "secrets.json"
+    secret_path.write_text("{}")
+    secret_path.chmod(0o600)
+    start = secret_path.parent / "start-workers"
+    child = """
+import sys
+import time
+from pathlib import Path
+from services.api.common import put_secret, delete_secret, settings
+worker = int(sys.argv[1])
+(settings.data_dir / f"ready-{worker}").touch()
+deadline = time.monotonic() + 15
+while not (settings.data_dir / "start-workers").exists():
+    assert time.monotonic() < deadline
+    time.sleep(0.01)
+for index in range(12):
+    ref = f"worker-{worker}-{index}"
+    put_secret(f"dummy-{worker}-{index}", ref)
+    if index % 3 == 0:
+        delete_secret(ref)
+"""
+    workers = [subprocess.Popen([sys.executable, "-c", child, str(i)],
+                                env=os.environ.copy(), stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True)
+               for i in range(4)]
+    try:
+        deadline = time.monotonic() + 15
+        while not all((secret_path.parent / f"ready-{i}").exists() for i in range(4)):
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        start.touch()
+        for worker in workers:
+            out, err = worker.communicate(timeout=25)
+            assert worker.returncode == 0, out + err
+    finally:
+        for worker in workers:
+            if worker.poll() is None:
+                worker.kill()
+                worker.wait(timeout=5)
+
+    expected = {f"worker-{worker}-{index}": f"dummy-{worker}-{index}"
+                for worker in range(4) for index in range(12) if index % 3 != 0}
+    assert json.loads(secret_path.read_text()) == expected
+    assert secret_path.stat().st_mode & 0o077 == 0
+    assert not list(secret_path.parent.glob(".secrets-*.tmp"))
+
+
+def case_provider_retirement_advances_graph_revisions(client, app):
+    """Pre-retirement project and node snapshots cannot restore a retired key."""
+    def provider(name):
+        return ok(client.post("/api/providers", json={
+            "name": name, "kind": "openai", "base_url": "http://127.0.0.1:12345/v1",
+            "model": "dummy", "api_key": "DUMMY-" + name,
+        }))
+
+    old, replacement = provider("A"), provider("B")
+    first = ok(client.post("/api/projects", json={
+        "name": "Project provider", "config": {"provider_id": old["id"]},
+    }))
+    first_nodes = [add_node(client, first, config={"provider_id": old["id"]})
+                   for _ in range(2)]
+    second = ok(client.post("/api/projects", json={"name": "Node-only provider"}))
+    second_node = add_node(client, second, config={"provider_id": old["id"]})
+    before = {ident: ok(client.get(f"/api/projects/{ident}"))["revision"]
+              for ident in (first["id"], second["id"])}
+    node_revisions = {node["id"]: node["revision"]
+                      for node in first_nodes + [second_node]}
+
+    result = ok(client.post(f"/api/providers/{old['id']}/retire", json={
+        "replacement_provider_id": replacement["id"],
+    }))
+    assert result["updated_reference_count"] >= 4
+    for ident in (first["id"], second["id"]):
+        after = ok(client.get(f"/api/projects/{ident}"))
+        assert after["revision"] == before[ident] + 1
+        assert ok(client.get(f"/api/projects/{ident}/graph"))["revision"] == after["revision"]
+    assert ok(client.get(f"/api/projects/{first['id']}"))["config"]["provider_id"] == replacement["id"]
+    for node in first_nodes + [second_node]:
+        refreshed = ok(client.get(f"/api/nodes/{node['id']}"))
+        assert refreshed["config"]["provider_id"] == replacement["id"]
+        assert refreshed["revision"] == node_revisions[node["id"]] + 1
+
+    stale = client.patch(f"/api/projects/{first['id']}", json={
+        "expected_revision": before[first["id"]], "config": {"provider_id": old["id"]},
+    })
+    assert ok(stale, 409)["detail"]["code"] == "REVISION_CONFLICT"
+    stale_node = client.patch(f"/api/nodes/{first_nodes[0]['id']}", json={
+        "expected_revision": before[first["id"]], "config": {"provider_id": old["id"]},
+    })
+    assert stale_node.status_code == 409
+    assert ok(client.get(f"/api/projects/{first['id']}"))["config"]["provider_id"] == replacement["id"]
+
+
+def case_retired_provider_blocks_cached_client_requests(client, app):
+    """A worker holding the old key cannot send a new request after retirement."""
+    from functools import partial
+    from threading import Event
+    from unittest.mock import patch
+    import httpx
+    from services.api.common import read_secret
+    from services.api.db import Session, Provider, ModelRequest, asdict
+    from research.agents.provider import ModelClient
+    from research.agents.budget import make_request_guard, BudgetExceeded
+    import research.agents.provider as provider_module
+
+    pricing = {"input_per_million": 1, "output_per_million": 1, "currency": "USD"}
+    created = ok(client.post("/api/providers", json={
+        "name": "Retirement guard dummy", "kind": "openai",
+        "base_url": "http://127.0.0.1:7777/v1", "model": "dummy-model",
+        "allow_paid": True, "config": {"budget_usd": 2, "pricing": pricing, "max_retries": 0},
+        "api_key": "RETIRED-DUMMY-KEY",
+    }))
+    with Session() as session:
+        stored = session.get(Provider, created["id"])
+        snapshot = asdict(stored, secrets=True)
+        old_key = read_secret(stored.credential_ref)
+    cached_client = ModelClient(snapshot, old_key, allow_paid=True,
+                                request_guard=make_request_guard(snapshot))
+    requests = []
+    inflight_started, release_inflight = Event(), Event()
+    hold_next = False
+
+    def reply(request):
+        requests.append(request)
+        if hold_next:
+            inflight_started.set()
+            assert release_inflight.wait(timeout=10)
+        assert request.headers["Authorization"] == "Bearer RETIRED-DUMMY-KEY"
+        return httpx.Response(200, json={
+            "id": "dummy-response", "model": "dummy-model",
+            "choices": [{"finish_reason": "stop", "message": {"content": '{"ok": true}'}}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 2},
+        })
+
+    original_client = provider_module.httpx.Client
+    with patch.object(provider_module.httpx, "Client",
+                      partial(original_client, transport=httpx.MockTransport(reply))):
+        first = cached_client.complete([{"role": "user", "content": "Before retirement"}],
+                                       max_output_tokens=24)
+    assert first["status"] == "completed" and len(requests) == 1
+
+    # A request already reserved before retirement can finish and account
+    # for actual usage, but any request authorized afterward must be blocked.
+    hold_next = True
+    with patch.object(provider_module.httpx, "Client",
+                      partial(original_client, transport=httpx.MockTransport(reply))):
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            outstanding = pool.submit(cached_client.complete,
+                                      [{"role": "user", "content": "Already in flight"}],
+                                      max_output_tokens=24)
+            assert inflight_started.wait(timeout=8)
+            try:
+                retired = ok(client.post(f"/api/providers/{created['id']}/retire", json={}))
+            finally:
+                release_inflight.set()
+            assert outstanding.result(timeout=10)["status"] == "completed"
+
+    assert retired["provider"]["status"] == "retired"
+    with Session() as session:
+        assert session.get(Provider, created["id"]).credential_ref is None
+
+    with patch.object(provider_module.httpx, "Client",
+                      partial(original_client, transport=httpx.MockTransport(reply))):
+        with pytest.raises(BudgetExceeded, match="retired"):
+            cached_client.complete([{"role": "user", "content": "After retirement"}],
+                                   max_output_tokens=24)
+    assert len(requests) == 2
+    with Session() as session:
+        entries = list(session.query(ModelRequest).filter(ModelRequest.provider_id == created["id"]))
+    assert len(entries) == 2 and all(entry.status == "settled" for entry in entries)
 
 
 def case_real_provider_failure_and_local_host(client, app):
