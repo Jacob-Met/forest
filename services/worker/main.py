@@ -230,7 +230,9 @@ def _agent_checkpoint(output, run_id):
     if usage_path.exists():
         try: usage=json.loads(usage_path.read_text())
         except (OSError,ValueError,UnicodeError): return None
-        if not isinstance(usage,dict) or usage.get('run_id')!=run_id: return None
+        from research.agents.lifecycle import validate_accounting_ledger, ReconciliationRequired
+        try: validate_accounting_ledger(usage, run_id, transcript_steps=len(checkpoint['transcript']))
+        except ReconciliationRequired: return None
         checkpoint={**checkpoint,**{key:usage[key] for key in (
             'totals','active_seconds','cost_complete','usage_complete') if key in usage}}
     return checkpoint
