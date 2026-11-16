@@ -913,7 +913,7 @@ def execute(run_id):
                 if fdir.exists():
                     s.add(Figure(project_id=pid,title={'comparison':'Main Results Comparison','calibration':'Calibration Reliability','method':'Method Architecture'}[fname],status='ready_for_review',data={'kind':'bar' if fname=='comparison' else fname,'run_ids':[selected[0].id],'metric':'brier','style':{},'outputs':{ext:str((fdir/f'figure.{ext}').relative_to(root)) for ext in ('svg','pdf','png') if (fdir/f'figure.{ext}').exists()},'code':(fdir/'plot.py').read_text() if (fdir/'plot.py').exists() else ''}))
             emit(s,pid,'compile_finished',{'paper_id':publication['paper_id'],'run_id':run_id,**publication})
-        return {'pdf_path':str((folder/'paper.pdf').relative_to(root)),'paper_source':str((folder/'paper.tex').relative_to(root)),'actual_compilation':True,**({'draft_reuse':reuse} if reuse is not None else {}),**publication}
+        return {'pdf_path':str((folder/'paper.pdf').relative_to(root)),'paper_source':str((folder/'paper.tex').relative_to(root)),'actual_compilation':True,'compilation_provenance':compiled['compilation_provenance'],**({'draft_reuse':reuse} if reuse is not None else {}),**publication}
     if kind=='paper_compile':
         from research.paper.manuscript import compile_paper
         from services.api.paper_state import locked_paper
@@ -936,7 +936,7 @@ def execute(run_id):
             with Session.begin() as s:
                 publication=publish_layout(s,pid,data,config,run_id)
                 emit(s,pid,'compile_finished',{'paper_id':publication['paper_id'],'run_id':run_id,**publication})
-            return {'pdf_path':data['pdf_path'],'paper_source':str((folder/'paper.tex').relative_to(root)),
+            return {'pdf_path':data['pdf_path'],'paper_source':str((folder/'paper.tex').relative_to(root)),'compilation_provenance':compiled['compilation_provenance'],
                     'actual_compilation':True,'layout_plan':plan,'layout_preflight':compiled.get('preflight'),**publication}
         if config.get('source_scope')=='workspace':
             from services.api.paper_state import publish_generation
@@ -958,7 +958,7 @@ def execute(run_id):
             with Session.begin() as s:
                 publication=publish_generation(s,pid,config.get('title') or 'Agent manuscript',data,config.get('paper_snapshot'),run_id)
                 emit(s,pid,'compile_finished',{'paper_id':publication['paper_id'],'run_id':run_id,**publication})
-            return {'pdf_path':data['pdf_path'],'paper_source':str((folder/'paper.tex').relative_to(root)),
+            return {'pdf_path':data['pdf_path'],'paper_source':str((folder/'paper.tex').relative_to(root)),'compilation_provenance':compiled['compilation_provenance'],
                     'actual_compilation':True,'source_scope':'workspace','origin_agent_run_id':config['origin_agent_run_id'],
                     'origin_source_path':config['origin_source_path'],**publication}
         folder=output/'paper'; source=root/'paper'
@@ -971,7 +971,8 @@ def execute(run_id):
                 p.data={**p.data,'log':compiled['log'],'errors':compiled.get('errors',[]),'layout_preflight':compiled.get('preflight'),'compiled_revision':p.revision,'pdf_path':str((folder/'paper.pdf').relative_to(root)) if compiled.get('pdf_path') else None}; p.status='ready_for_review' if compiled['status']=='completed' else 'compile_failed'
             emit(s,pid,'compile_finished',{'paper_id':p.id,'status':compiled['status'],'run_id':run_id})
         if compiled['status']!='completed': raise RuntimeError(compiled['log'][-12000:])
-        return {'pdf_path':str((folder/'paper.pdf').relative_to(root)),'compiled_revision':config['paper_revision']}
+        return {'pdf_path':str((folder/'paper.pdf').relative_to(root)),'paper_source':str((folder/'paper.tex').relative_to(root)),
+                'compilation_provenance':compiled['compilation_provenance'],'compiled_revision':config['paper_revision']}
     if kind=='literature':
         from research.literature.sources import search, import_identifier
         query=config.get('query') or config.get('instructions') or config.get('project_goal')

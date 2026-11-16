@@ -6,6 +6,7 @@ reviewer's evidenced judgment and no machine audit predicts venue acceptance.
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -365,6 +366,25 @@ def assess_submission(root, profile=None, *, sources=(), runs=(), manifest=None)
             raise ValueError('The manuscript PDF is not the artifact produced by the declared completed compilation')
         if actual_source and _path(root,actual_source)!=source:
             raise ValueError('The manuscript source does not match the declared completed compilation')
+        provenance=compiled_run.get('metrics',{}).get('compilation_provenance')
+        if not actual_source or not isinstance(provenance,dict) or not all(
+                isinstance(provenance.get(key),str) and re.fullmatch(r'[0-9a-f]{64}',provenance[key])
+                for key in ('source_sha256','pdf_sha256')) or 'references_bib_sha256' not in provenance:
+            raise ValueError('The declared run lacks compiled source/PDF fingerprints; recompile the current manuscript')
+        def current_digest(path):
+            if not path.is_file():
+                return None
+            with path.open('rb') as stream:
+                return hashlib.file_digest(stream,'sha256').hexdigest()
+        for expected,path,reason in (
+                ('source_sha256',source,'Manuscript source changed since compilation'),
+                ('pdf_sha256',pdf,'Manuscript PDF changed since compilation'),
+                ('references_bib_sha256',source.parent/'references.bib','Bibliography changed since compilation')):
+            saved=provenance[expected]
+            if saved is not None and (not isinstance(saved,str) or not re.fullmatch(r'[0-9a-f]{64}',saved)):
+                raise ValueError('The declared compilation has malformed file provenance; recompile')
+            if saved!=current_digest(path):
+                raise ValueError(reason+'; recompile before submission review')
         for rid,review,review_path in review_records:
             inspected=review.get('reviewed_run_ids',[])
             required=measured_runs|set(analysis_ids)|{paper['compile_run_id']}

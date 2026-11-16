@@ -50,6 +50,31 @@ def test_compiler_reads_local_includes_but_not_host_files(tmp_path, monkeypatch,
     assert not (paper / "paper.pdf").exists()
 
 
+def test_compilation_does_not_return_a_pdf_for_source_changed_during_tex(tmp_path, monkeypatch):
+    if not shutil.which('pdflatex') or not shutil.which('bwrap'):
+        pytest.skip('Real sandboxed pdflatex required')
+    from research.paper import manuscript
+    (tmp_path / 'paper.tex').write_text(_document('Original at invocation.'))
+    real_run = subprocess.run
+    calls = 0
+
+    def changed_after_first_pass(*args, **kwargs):
+        nonlocal calls
+        result = real_run(*args, **kwargs)
+        calls += 1
+        if calls == 1:
+            (tmp_path / 'paper.tex').write_text(_document('Changed during compilation.'))
+        return result
+
+    monkeypatch.setattr(manuscript.subprocess, 'run', changed_after_first_pass)
+    result = compile_paper(tmp_path)
+    assert calls >= 1
+    assert result['status'] == 'failed'
+    assert 'Manuscript inputs changed during compilation' in result['log']
+    assert result['compilation_provenance'] is None
+    assert not (tmp_path / 'paper.pdf').exists()
+
+
 def test_missing_os_sandbox_fails_closed(tmp_path, monkeypatch):
     if not (shutil.which("pdflatex") or shutil.which("tectonic")):
         pytest.skip("A real TeX compiler is required")
