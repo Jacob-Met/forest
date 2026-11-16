@@ -2,8 +2,7 @@
 from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import urljoin
-import httpx
-from .sources import _public_url
+from .sources import _public_stream
 
 class TextPage(HTMLParser):
     def __init__(self): super().__init__(); self.hidden=0; self.parts=[]; self.title=''; self.in_title=False
@@ -19,10 +18,9 @@ class TextPage(HTMLParser):
         if not self.hidden: self.parts.append(data)
 
 def read_page(url,output_dir,screenshot=False):
-    initial=url; target=Path(output_dir); target.mkdir(parents=True,exist_ok=True)
+    target=Path(output_dir); target.mkdir(parents=True,exist_ok=True)
     for _ in range(6):
-        _public_url(url)
-        with httpx.stream('GET',url,follow_redirects=False,timeout=30,headers={'User-Agent':'FOREST-research/1.0'}) as response:
+        with _public_stream(url, timeout=30) as response:
             if response.is_redirect: url=urljoin(url,response.headers['location']); continue
             response.raise_for_status(); data=b''
             for chunk in response.iter_bytes():
@@ -50,12 +48,41 @@ def read_page(url,output_dir,screenshot=False):
                 from playwright.sync_api import sync_playwright
                 with sync_playwright() as playwright:
                     browser=playwright.chromium.launch(channel='chrome',headless=True)
-                    context=browser.new_context(viewport={'width':1440,'height':1000})
+                    context=browser.new_context(viewport={'width':1440,'height':1000},
+                                                java_script_enabled=False, service_workers='block')
+                    resource_bytes=0
                     def restrict(route):
+                        nonlocal resource_bytes
+                        request=route.request
+                        if request.url.startswith(('data:','blob:')):
+                            route.continue_(); return
+                        if request.method != 'GET':
+                            route.abort(); return
                         try:
-                            if route.request.url.startswith(('data:','blob:')): route.continue_(); return
-                            _public_url(route.request.url); route.continue_()
-                        except Exception: route.abort()
+                            # The main document has already passed the pinned
+                            # transport. Serve the same bytes, not a second DNS
+                            # resolution with possibly different content.
+                            if request.is_navigation_request() and request.url == url:
+                                route.fulfill(status=200, headers={'content-type':response.headers.get('content-type','text/html')}, body=data)
+                                return
+                            with _public_stream(request.url, timeout=12,
+                                                headers={'User-Agent':'FOREST-research/1.0',
+                                                         'Accept':request.headers.get('accept','*/*')}) as resource:
+                                payload=bytearray()
+                                for part in resource.iter_bytes():
+                                    payload.extend(part)
+                                    if len(payload)>5_000_000 or resource_bytes+len(payload)>20_000_000:
+                                        raise ValueError('Screenshot resource budget exceeded')
+                                resource_bytes+=len(payload)
+                                # httpx decodes compressed bodies; never forward
+                                # their original compression or length metadata.
+                                headers={k:v for k,v in resource.headers.items()
+                                         if k.lower() not in ('content-encoding','content-length',
+                                                              'transfer-encoding','connection')}
+                                route.fulfill(status=resource.status_code, headers=headers,
+                                              body=bytes(payload))
+                        except Exception:
+                            route.abort()
                     context.route('**/*',restrict); page=context.new_page(); page.goto(url,wait_until='domcontentloaded',timeout=30000); page.screenshot(path=str(target/'page.png'),full_page=True); browser.close()
                 result['screenshot_path']=str(target/'page.png')
             return result
