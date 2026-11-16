@@ -1,6 +1,7 @@
 """Actual Crossref/arXiv retrieval, PDF passages, and bibliography import/export."""
 from __future__ import annotations
 
+from contextlib import contextmanager
 import html
 import ipaddress
 import json
@@ -8,11 +9,14 @@ import os
 from pathlib import Path
 import re
 import socket
+import ssl
 import time
 from urllib.parse import quote, urlencode, urlparse, urlsplit
 from uuid import uuid4
 import xml.etree.ElementTree as ET
 
+import certifi
+import httpcore
 import httpx
 
 _ARXIV_LAST = 0.0
@@ -201,12 +205,77 @@ def extract_pdf(path: str | Path) -> list[dict]:
 
 
 def _public_url(url):
+    """Validate *all* DNS answers and return the addresses to use for this fetch.
+
+    The caller must connect to these literal IPs, not resolve the hostname a
+    second time after validation. Host headers and TLS SNI remain the URL host.
+    """
     parsed = urlparse(url)
     if parsed.scheme not in {"https", "http"} or not parsed.hostname or parsed.username or parsed.password:
         raise ValueError("Only public HTTP(S) URLs are supported")
-    for _, _, _, _, address in socket.getaddrinfo(parsed.hostname, parsed.port or 443):
-        if not ipaddress.ip_address(address[0]).is_global:
+    port = parsed.port or (443 if parsed.scheme == 'https' else 80)
+    addresses = socket.getaddrinfo(parsed.hostname, port, type=socket.SOCK_STREAM)
+    if not addresses or len(addresses) > 32:
+        raise ValueError("Public URL DNS resolution returned no usable addresses")
+    ips = tuple(dict.fromkeys(address[4][0] for address in addresses))
+    for ip in ips:
+        if not ipaddress.ip_address(ip).is_global:
             raise ValueError("Private/network-local literature URLs are not allowed")
+    return ips
+
+
+class _PublicNetworkBackend(httpcore.SyncBackend):
+    """Send sockets only to the DNS results checked for the current URL."""
+
+    def __init__(self, hostname, port, ips):
+        super().__init__()
+        self._hostname = hostname.encode('idna').decode('ascii').lower()
+        self._port = port
+        self._ips = ips
+
+    def connect_tcp(self, host, port, timeout=None, local_address=None, socket_options=None):
+        name = host.decode('ascii') if isinstance(host, bytes) else str(host)
+        if name.lower() != self._hostname or port != self._port:
+            raise ValueError('Connection target changed after public URL validation')
+        failure = None
+        for ip in self._ips:
+            try:
+                return super().connect_tcp(ip, port, timeout=timeout,
+                                           local_address=local_address, socket_options=socket_options)
+            except (httpcore.ConnectError, httpcore.ConnectTimeout) as exc:
+                failure = exc
+        if failure is not None:
+            raise failure
+        raise ValueError('No validated public IP available')
+
+    def connect_unix_socket(self, *args, **kwargs):
+        raise ValueError('Unix sockets cannot be used for public URLs')
+
+
+class _PublicHTTPTransport(httpx.HTTPTransport):
+    """Use httpx's HTTP/TLS handling with a pinned httpcore network backend."""
+
+    def __init__(self, hostname, port, ips):
+        super().__init__(trust_env=False)
+        old_pool = self._pool
+        self._pool = httpcore.ConnectionPool(
+            ssl_context=ssl.create_default_context(cafile=certifi.where()),
+            network_backend=_PublicNetworkBackend(hostname, port, ips),
+        )
+        old_pool.close()
+
+
+@contextmanager
+def _public_stream(url, *, timeout=30, headers=None):
+    """Make one HTTP request without proxies or a post-validation DNS lookup."""
+    ips = _public_url(url)
+    parsed = urlparse(url)
+    port = parsed.port or (443 if parsed.scheme == 'https' else 80)
+    transport = _PublicHTTPTransport(parsed.hostname, port, ips)
+    with httpx.Client(transport=transport, trust_env=False) as client:
+        with client.stream('GET', url, follow_redirects=False, timeout=timeout,
+                           headers=headers or {'User-Agent': 'FOREST-research/1.0'}) as response:
+            yield response
 
 
 def download_pdf(url, target):
@@ -214,8 +283,7 @@ def download_pdf(url, target):
     target = Path(target)
     target.parent.mkdir(parents=True, exist_ok=True)
     for _ in range(6):
-        _public_url(url)
-        with httpx.stream("GET", url, timeout=45, follow_redirects=False, headers={"User-Agent": "FOREST-research/1.0"}) as response:
+        with _public_stream(url, timeout=45) as response:
             if response.is_redirect:
                 from urllib.parse import urljoin
                 url = urljoin(url, response.headers["location"])
