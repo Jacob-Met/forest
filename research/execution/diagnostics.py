@@ -153,7 +153,9 @@ def run_diagnostics(folder, *, run_id, status, config=None, resource=None):
         updated = result_path if _regular(result_path, root) else task_path
         processes.append(_process({'command': config.get('command')}, state, {}, process_id=task.get('task_id', 'command'),
                                   backend=kind, observed_at=_mtime(updated), secrets=secrets))
-    repository = _read(root / 'repository.json', root)
+    # Repository output files are task-writable. Only the saved supervisor
+    # record can attest which checkout the worker actually acquired.
+    repository = resource.get('repository_source') or {}
     source = {key: repository[key] for key in ('url', 'ref', 'requested_ref', 'commit', 'directory', 'transport') if key in repository}
     source = {key: _text(value, secrets) for key, value in source.items() if isinstance(value, str)}
     log = root / 'stdout.txt'
