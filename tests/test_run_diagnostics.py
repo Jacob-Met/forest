@@ -23,9 +23,9 @@ def test_command_progress_and_source_keep_real_receipts_and_redact_credentials(t
         'requested_ref': 'main', 'commit': 'a' * 40, 'directory': 'source', 'transport': 'https',
         'token': 'must-not-be-returned', 'identity_file': '/private/key'})
     (tmp_path / 'stdout.txt').write_text('real command output\n')
-    result = run_diagnostics(tmp_path, run_id='r1', status='running', config={'repository': {'url': 'example'}, 'env': {'API_TOKEN': 'private-value'}}, resource={'elapsed_seconds': 4})
+    result = run_diagnostics(tmp_path, run_id='r1', status='running', config={'repository': {'url': 'example'}, 'env': {'API_TOKEN': 'private-value'}}, resource={'elapsed_seconds': 4, 'repository_source': {'url': 'https://github.com/owner/repo.git', 'commit': 'b' * 40, 'requested_ref': 'main', 'directory': 'source', 'transport': 'https'}})
     assert result['phase'] == 'executing'
-    assert result['repository']['commit'] == 'a' * 40
+    assert result['repository']['commit'] == 'b' * 40
     assert result['logs']['bytes'] == len(b'real command output\n')
     output = json.dumps(result)
     assert all(secret not in output for secret in ('private-value', 'other-private', 'must-not-be-returned', '/private/key'))
