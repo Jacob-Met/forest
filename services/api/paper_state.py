@@ -3,6 +3,8 @@
 Generated bundles remain ordinary files in their run directories. Replacing an edited or newer
 working manuscript requires applying a concrete review against its exact revision.
 """
+import hashlib
+import json
 import logging
 import shutil
 from copy import deepcopy
@@ -14,7 +16,7 @@ from sqlalchemy import event, select
 from sqlalchemy.orm import object_session
 
 from .common import emit, error, get, project_dir, safe_path
-from .db import FileRevision, PaperDocument, Review, TaskRun, Project
+from .db import FileRevision, PaperDocument, Review, TaskRun, Project, ResearchClaim, SourcePaper
 
 
 def enqueue_workspace_compile(session, agent_run_id, workspace, arguments, request_id):
@@ -342,8 +344,38 @@ def publication_goal_current(session, project_id, data, run_id):
     return True
 
 
+def library_source_fingerprint(session, project_id):
+    """Stable receipt for the exact project Library records handed to a writer.
+
+    Publication checks it after taking the project writer lock. This closes
+    the race where an API edit lands *during* manuscript compilation, after
+    draft admission but before the paper becomes current.
+    """
+    def records(model):
+        return [{'id': row.id, 'revision': row.revision, 'status': row.status,
+                 'title': row.title, 'data': row.data}
+                for row in session.scalars(select(model).where(
+                    model.project_id == project_id).order_by(model.id))]
+
+    material = {'sources': records(SourcePaper), 'claims': records(ResearchClaim)}
+    serialized = json.dumps(material, sort_keys=True, ensure_ascii=False,
+                            separators=(',', ':')).encode('utf-8')
+    return hashlib.sha256(serialized).hexdigest()
+
+
+def require_current_library_sources(session, project_id, data):
+    expected = data.get('library_source_fingerprint')
+    if expected is None:
+        return  # Explicitly authored papers and legacy compilations lack Library receipts.
+    if (not isinstance(expected, str) or len(expected) != 64
+            or any(char not in '0123456789abcdef' for char in expected)
+            or expected != library_source_fingerprint(session, project_id)):
+        raise ValueError('Library source evidence changed during manuscript generation; request a fresh draft against current sources')
+
+
 def publish_generation(session, project_id, title, data, snapshot, run_id):
     paper = locked_project_paper(session, project_id)
+    require_current_library_sources(session, project_id, data)
     if paper is None:
         paper = PaperDocument(project_id=project_id, title=title, data={})
         session.add(paper)
@@ -391,6 +423,7 @@ def apply_generation_review(session, review, paper, indices):
     if indices != [0]:
         error('INVALID_SELECTION', 'Select the complete manuscript replacement to apply this proposal', 422)
     data = review.data
+    require_current_library_sources(session, paper.project_id, data['proposed_data'])
     if not publication_goal_current(session, paper.project_id, data['proposed_data'], data['run_id']):
         error('GOAL_APPLICABILITY_REQUIRED', 'Review the generation and its evidence against the current goal before publishing', 409)
     if data['edits'][0]['original'] != paper.data.get('source', ''):

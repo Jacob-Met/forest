@@ -1,6 +1,7 @@
 """Real-provider drafting with retained responses and explicit validation repair."""
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 import uuid
@@ -75,15 +76,30 @@ def draft_from_saved_response(response_path, evidence, output_dir, *, origin_run
     draft = json.loads(response['text'])
     if not isinstance(draft, dict):
         raise ValueError('Saved response text must contain a manuscript object')
-    original_context_available = original_evidence_path is not None and Path(original_evidence_path).is_file()
-    if original_context_available:
-        original = json.loads(Path(original_evidence_path).read_text())
-        # Preserve both numeric identity/value and string row context. Ordinary
-        # files stay editable; changed evidence calls for a new authoring pass.
-        original_metrics = [(r['id'], r['metrics']) for r in original.get('runs', [])]
-        current_metrics = [(r['id'], r['metrics']) for r in evidence['runs']]
-        if original_metrics != current_metrics:
-            raise ValueError('Saved response evidence values or row identities changed; request a fresh draft for the new evidence')
+    # The author saw a particular evidence snapshot, not merely stable source
+    # IDs. A Library PATCH can reuse a source/passage ID for opposite text.
+    # Reject legacy responses without their originating evidence snapshot:
+    # there is no defensible way to verify a saved claim against it.
+    if original_evidence_path is None or not Path(original_evidence_path).is_file():
+        raise ValueError('Saved response has no original evidence snapshot; request a fresh draft')
+    original = json.loads(Path(original_evidence_path).read_text(encoding='utf-8'))
+    if (not isinstance(original, dict) or not isinstance(original.get('runs'), list)
+            or any(not isinstance(original.get(key), list) for key in ('sources', 'claims'))):
+        raise ValueError('Saved response original evidence snapshot is incomplete; request a fresh draft')
+    original_metrics = [(r['id'], r['metrics']) for r in original['runs']]
+    current_metrics = [(r['id'], r['metrics']) for r in evidence['runs']]
+    if original_metrics != current_metrics:
+        raise ValueError('Saved response evidence values or row identities changed; request a fresh draft for the new evidence')
+    # All supplied Library material is part of the Writer's prompt, even when
+    # only a subset gets explicit citations. Compare semantic source/passages
+    # and research-claim content instead of trusting unchanged record IDs.
+    if original['sources'] != evidence.get('sources'):
+        raise ValueError('Saved response source evidence changed (metadata or passages); request a fresh draft for the current Library')
+    if original['claims'] != evidence.get('claims'):
+        raise ValueError('Saved response research claim evidence changed; request a fresh draft for the current claims')
+    evidence_source_sha256 = hashlib.sha256(json.dumps(
+        {'sources': original['sources'], 'claims': original['claims']},
+        sort_keys=True, ensure_ascii=False, separators=(',', ':')).encode('utf-8')).hexdigest()
     revision = None
     changes = []
     if revision_path is not None:
@@ -101,8 +117,9 @@ def draft_from_saved_response(response_path, evidence, output_dir, *, origin_run
                   'original_response_id': response.get('response_id'), 'new_model_requests': 0,
                   'new_model_cost_usd': 0, 'requested_manuscript_type': expected_type,
                   'evidence_run_ids': [run['id'] for run in evidence['runs']],
-                  'original_evidence_context_available': original_context_available,
-                  'evidence_validation': 'Original and current metric values/row identities agree' if original_context_available else 'Current evidence revalidated; original ordered run selection retained; original evidence context was not saved',
+                  'original_evidence_context_available': True,
+                  'evidence_source_sha256': evidence_source_sha256,
+                  'evidence_validation': 'Original and current metric identities, values, Library source passages, metadata and claims agree',
                   'validation': validation}
     if revision is not None:
         provenance['mode'] = 'saved_response_with_recorded_revision'

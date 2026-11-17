@@ -837,13 +837,13 @@ def execute(run_id):
         from research.paper.manuscript import generate_paper,compile_paper,collect_evidence,manuscript_prompt
         from research.paper.layout import normalize_layout
         selected_layout=normalize_layout(config.get('layout'),config.get('template','article'))
-        from services.api.paper_state import publish_generation
+        from services.api.paper_state import library_source_fingerprint, publish_generation
         with Session() as s: selected=latest_experiment(s,pid,config.get('run_ids'))
         if not selected: raise ValueError('A completed scientific run is required')
         for evidence_run in selected:
             if evidence_run.kind=='agent' and not any(x.get('status')=='completed' and x.get('exit_code')==0 for x in evidence_run.metrics.get('executions',[])):
                 raise ValueError('Agent metric evidence requires an actual successful computation receipt: '+evidence_run.id)
-        source=safe_path(root,selected[0].output_path,True); folder=output/'paper'; reuse=None
+        source=safe_path(root,selected[0].output_path,True); folder=output/'paper'; reuse=None; library_stamp=None
         has_saved_response='saved_response_run_id' in config or 'saved_response_path' in config
         if 'draft_revision_path' in config and not has_saved_response:
             raise ValueError('draft_revision_path requires an explicitly selected saved response')
@@ -853,9 +853,15 @@ def execute(run_id):
             from examples.class_weight_paper import generate_example_paper
             generated=generate_example_paper(source,folder,config.get('title'),config.get('template','article'))
         else:
-            with Session() as s:
+            # Build the evidence and its Library revision receipt under one
+            # project edit lock. Otherwise a PATCH between SELECTs could pair
+            # old source passages with a *new* fingerprint (on READ COMMITTED).
+            from services.worker.scheduler import _lock_project
+            with Session.begin() as s:
+                _lock_project(s,pid)
                 sources=[asdict(x) for x in s.scalars(select(SourcePaper).where(SourcePaper.project_id==pid))]
                 claims=[{'id':x.id,**x.data} for x in s.scalars(select(ResearchClaim).where(ResearchClaim.project_id==pid))]
+                library_stamp=library_source_fingerprint(s,pid)
                 figures=manuscript_figures(s,pid,root,selected,config.get('figure_ids'))
             from research.paper.evidence import resolve_run_metrics_file
             evidence=collect_evidence(runs=[{'id':r.id,'status':r.status,'directory':str(safe_path(root,r.output_path,True)), 'metrics_file':resolve_run_metrics_file(safe_path(root,r.output_path,True),r.config.get('metrics_file','metrics.json')), 'config':{k:v for k,v in r.config.items() if k not in ('provider_snapshot','env')}} for r in selected],sources=sources,claims=claims,required_run_ids=config.get('run_ids'),figures=figures)
@@ -909,6 +915,7 @@ def execute(run_id):
         with Session.begin() as s:
             data={'source':(folder/'paper.tex').read_text(),'bibtex':(folder/'references.bib').read_text(),'pdf_path':str((folder/'paper.pdf').relative_to(root)),'log':compiled['log'],'bindings':([{'run_id':r['id'],'path':str((Path(r['directory'])/r['metrics_file']).relative_to(root))} for r in evidence['runs']] if config.get('example')!='class_weight_calibration' else [{'run_id':selected[0].id,'path':str((source/'metrics.json').relative_to(root))}]),'numeric_bindings':generated['bindings'],'source_run_ids':[r.id for r in selected],'source_dir':str(folder.relative_to(root))}
             if reuse is not None: data['draft_reuse']=reuse
+            if library_stamp is not None: data['library_source_fingerprint']=library_stamp
             if generated.get('dependency_bindings'):
                 from research.paper.dependencies import bind_source_files
                 data['draft_path']=str((folder/'draft.json').relative_to(root))
