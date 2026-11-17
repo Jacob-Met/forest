@@ -345,9 +345,9 @@ def scenario():
         run=s.get(TaskRun,new.id);run.config={'remote':{'hostname':'owner-host'},'execution_attempt':{'id':'current-attempt'}}
         sync_scopes(s,pid);s.flush()
         remote_scope=s.scalar(select(ObservationScope).where(ObservationScope.object_id==new.id,ObservationScope.kind=='remote_workspace'));remote_id=remote_scope.id
-    capture(new.id,{'files':[{'path':'result.json','content':'{"value":999}','size':13}]},'old-attempt')
+    capture(new.id,{'files':[{'path':'result.json','content':'{"value":999}','size':13, 'mtime_ns':0}], 'scan_ok':True, 'cursor_found':True, 'cursor':'', 'has_more':False},'old-attempt')
     with Session() as s:assert not list(s.scalars(select(ObservedFile).where(ObservedFile.scope_id==remote_id)))
-    capture(new.id,{'files':[{'path':'result.json','content':'{"value":-1}','size':12}]},'current-attempt')
+    capture(new.id,{'files':[{'path':'result.json','content':'{"value":-1}','size':12, 'mtime_ns':0}], 'scan_ok':True, 'cursor_found':True, 'cursor':'', 'has_more':False},'current-attempt')
     with Session() as s:
         saved=s.scalar(select(ObservedFile).where(ObservedFile.scope_id==remote_id));assert saved.content==b'{"value":-1}' and saved.attempt_id=='current-attempt'
     # Pool contention in the real SSE handler must leave the event loop runnable.
