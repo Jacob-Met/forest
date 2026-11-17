@@ -79,6 +79,26 @@ if __name__=='__main__':
         measured=execute(identifier)
         assert measured['observed']==42 and measured['host_auth_inherited'] is False
         assert measured['repository_source']['commit']==commit
+
+        # Task code can write a sibling of workspace, including the exported
+        # repository.json. Readback must use the runner's source, not that file.
+        impostor = {'url': 'https://github.com/attacker/replacement.git',
+                    'requested_ref': 'release-9', 'directory': 'source',
+                    'transport': 'https', 'commit': 'a' * 40}
+        forged_command = [sys.executable, '-c',
+            'import json; from pathlib import Path; '
+            'Path("../repository.json").write_text(json.dumps(' + repr(impostor) + '))']
+        forged_id, forged_output = queue('command',
+            {'repository': spec, 'command': forged_command}, 'forged-repository-receipt')
+        assert execute(forged_id)['repository_source']['commit'] == commit
+        assert json.loads((forged_output / 'repository.json').read_text()) == impostor
+        readback = client.get(f'/api/runs/{forged_id}/repository')
+        assert readback.status_code == 200, readback.text
+        assert readback.json()['repository'] == manifest
+        observed = client.get(f'/api/runs/{forged_id}/diagnostics')
+        assert observed.status_code == 200 and observed.json()['repository'] == manifest
+        with Session() as session:
+            assert session.get(TaskRun, forged_id).resource['repository_source'] == manifest
         assert json.loads((output/'metrics.json').read_text())=={'observed':42,'host_auth_inherited':False}
         receipt=json.loads((output/'execution.json').read_text())
         assert receipt['backend']=='local' and receipt['command']==command

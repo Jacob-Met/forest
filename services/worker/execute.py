@@ -441,6 +441,17 @@ def execute(run_id):
             raise ValueError('Repository sources are supported for agent, command, experiment, and repository_clone tasks')
         config={**config,'repository':normalize_repository(config.get('repository'))}
         repository_source=prepare_repository(config['repository'],workspace,output)
+        # Commit source identity to supervisor-owned state before any task code
+        # runs. The adjacent repository.json is a workspace artifact that a
+        # command can overwrite; it must never become API authority.
+        from research.execution.repository import RepositoryError
+        with Session.begin() as session:
+            live = get(session, TaskRun, run_id, for_update=True)
+            previous = (live.resource or {}).get('repository_source')
+            if previous is not None and previous != repository_source:
+                raise RepositoryError('Stored source identity differs from the acquired checkout; reconcile the original run',
+                                      'REPOSITORY_SOURCE_MISMATCH')
+            live.resource = {**(live.resource or {}), 'repository_source': repository_source}
     # Entry points run inside this interpreter. Scrub inherited host Git auth
     # references here too, after the host-only repository preparation phase.
     from research.execution.repository import task_environment

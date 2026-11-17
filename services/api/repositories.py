@@ -1,5 +1,4 @@
 """Durable repository preparation and credential-free source provenance."""
-import json
 import re
 
 from fastapi import APIRouter, Body
@@ -7,7 +6,7 @@ from sqlalchemy import select
 
 from research.execution.repository import normalize_repository, RepositoryError
 from services.worker.scheduler import enqueue, _lock_project
-from .common import error, get, project_dir, safe_path
+from .common import error, get
 from .db import Session, TaskRun, asdict
 
 
@@ -48,26 +47,23 @@ def repository_manifest(ident: str):
         run = get(session, TaskRun, ident)
         response = {'run_id': ident, 'project_id': run.project_id,
                     'status': run.status, 'repository': None}
-        if not run.output_path:
-            return response
-        folder = safe_path(project_dir(run.project_id), run.output_path)
-        manifest = safe_path(folder, 'repository.json')
-        if not manifest.exists():
-            return response
+        # Only the executor's persisted source receipt is authoritative.
+        # The output directory is writable by task commands, so even a
+        # well-formed repository.json cannot establish Git provenance.
+        data = (run.resource or {}).get('repository_source')
+        if data is None:
+            return response  # Legacy runs have unverified provenance.
         try:
-            if not manifest.is_file() or manifest.stat().st_size > 65536:
-                raise ValueError('Invalid manifest file')
-            data = json.loads(manifest.read_text(encoding='utf-8'))
             if not isinstance(data, dict):
-                raise ValueError('Invalid manifest object')
+                raise ValueError('Invalid source record')
             spec = normalize_repository({'url': data.get('url'),
                 'ref': data.get('requested_ref'), 'directory': data.get('directory'),
                 'transport': data.get('transport')})
             commit = data.get('commit')
             if not isinstance(commit, str) or not re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', commit):
                 raise ValueError('Invalid source commit')
-        except (OSError, UnicodeError, ValueError, TypeError):
-            error('INVALID_REPOSITORY_MANIFEST', 'The saved repository manifest is invalid', 422)
+        except (ValueError, TypeError):
+            error('INVALID_REPOSITORY_MANIFEST', 'The runner source receipt is invalid', 422)
         response['repository'] = {'url': spec['url'], 'requested_ref': spec['ref'],
             'commit': commit, 'directory': spec['directory'], 'transport': spec['transport']}
         return response

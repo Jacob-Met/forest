@@ -101,18 +101,26 @@ if __name__ == '__main__':
                     'directory': 'source', 'transport': 'https'}
         manifest.write_text(json.dumps({**recorded, 'credential': 'private-profile',
             'identity_file': '/private/key', 'token': 'private-token'}))
+        # A task-writable file is not an authoritative source identity.
         response = client.get(manifest_endpoint)
         assert response.status_code == 200, response.text
-        assert response.json()['repository'] == recorded
+        assert response.json()['repository'] is None
+        with Session.begin() as session:
+            current = session.get(TaskRun, run['id'])
+            current.resource = {**current.resource, 'repository_source': recorded}
+        response = client.get(manifest_endpoint)
+        assert response.status_code == 200 and response.json()['repository'] == recorded
         assert 'private' not in response.text
         manifest.write_text(json.dumps({**recorded, 'commit': 'secret-token'}))
+        # A corrupt/untrusted workspace file cannot override persisted source.
         response = client.get(manifest_endpoint)
-        assert response.status_code == 422 and 'secret-token' not in response.text
+        assert response.status_code == 200 and response.json()['repository'] == recorded
+        assert 'secret-token' not in response.text
         manifest.unlink()
         outside = project_dir(pid).parent / 'outside-manifest.json'
         outside.write_text(json.dumps(recorded))
         manifest.symlink_to(outside)
-        assert client.get(manifest_endpoint).status_code == 403
+        assert client.get(manifest_endpoint).json()['repository'] == recorded
         manifest.unlink()
         assert client.get('/api/runs/missing/repository').status_code == 404
 
