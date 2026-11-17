@@ -133,13 +133,41 @@ print(json.dumps(s))
     def observe(self, job, cursor=''):
         # The executor already owns this exact remote workspace. No UI-triggered SSH.
         script = 'ROOT='+repr(job['workdir'])+'\nCURSOR='+repr(cursor)+'\n'+r'''import os,json,pathlib
+import stat
 root=pathlib.Path(ROOT).resolve(); page=[]; more=False; budget=0
 excluded={'node_modules','__pycache__','agent_session.json','secrets.json','credentials.json','model_context','planning_sessions','model_responses','venv'}
-# Sorted depth-first order and a cursor in that order; no full-tree materialization.
+# A completed inventory must certify every traversed directory. os.walk()
+# ignores failures both in scandir and some entry classification operations.
+scan_error=None
+def unreadable(_error):
+ global scan_error
+ if scan_error is None: scan_error='Remote inventory path is unavailable'
+def checked_walk(directory):
+ try:
+  mode=directory.stat().st_mode
+  if not stat.S_ISDIR(mode) or not mode & 0o444 or not mode & 0o111:
+   raise PermissionError('Remote directory has no browse permission')
+  with os.scandir(directory) as listing: entries=list(listing)
+ except OSError as exc:
+  unreadable(exc); return
+ subdirs=[]; filenames=[]
+ for entry in entries:
+  try:
+   if entry.is_symlink(): continue
+   if entry.is_dir(follow_symlinks=False):
+    if not entry.name.startswith('.') and entry.name not in excluded:
+     subdirs.append(pathlib.Path(entry.path))
+   else: filenames.append(entry.name)
+  except OSError as exc:
+   unreadable(exc); return
+ yield directory,sorted(filenames)
+ for child in sorted(subdirs):
+  if scan_error: return
+  yield from checked_walk(child)
+# Sorted depth-first, cursor-stable, with bounded per-directory memory.
 found=not CURSOR
-for directory,dirs,files in os.walk(root,followlinks=False):
- dirs[:]=sorted(v for v in dirs if not v.startswith('.') and v not in excluded and not (pathlib.Path(directory)/v).is_symlink())
- for name in sorted(files):
+for directory,files in checked_walk(root):
+ for name in files:
   p=pathlib.Path(directory)/name; relative=p.relative_to(root).as_posix()
   if name.startswith('.') or name in excluded or p.is_symlink() or p.suffix in ('.pem','.key','.p12','.pfx'): continue
   if not found:
@@ -154,9 +182,14 @@ for directory,dirs,files in os.walk(root,followlinks=False):
      try: item['content']=before.decode('utf-8'); budget+=len(before)
      except UnicodeDecodeError: pass
    page.append(item)
-  except OSError: continue
- if more: break
-print(json.dumps({'files':page,'cursor':CURSOR,'has_more':more,'next_cursor':page[-1]['path'] if more and page else None,'cursor_found':found}))
+  except OSError:
+   unreadable(None)
+   continue
+ if more or scan_error: break
+print(json.dumps({'files':page, 'cursor':CURSOR, 'has_more':more,
+                  'next_cursor':page[-1]['path'] if more and page else None,
+                  'cursor_found':found, 'scan_ok':scan_error is None,
+                  'error':scan_error}))
 '''
         return json.loads(self.command(['python3','-c',script]))
 
