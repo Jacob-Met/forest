@@ -632,7 +632,7 @@ def case_explicit_evidence_scope_never_selects_an_unrequested_run(client):
 def case_saved_response_rerenders_with_actual_evidence_without_model(client):
     """An authored replay fixture exercises reuse; no model response is faked."""
     from sqlalchemy import select, func
-    from services.api.db import Session, TaskRun, SourcePaper, ModelRequest
+    from services.api.db import Session, TaskRun, SourcePaper, PaperDocument, ModelRequest
     from services.api.common import project_dir
     from services.worker.scheduler import enqueue
     from services.worker.execute import saved_paper_response
@@ -663,6 +663,16 @@ def case_saved_response_rerenders_with_actual_evidence_without_model(client):
     path.parent.mkdir(parents=True)
     response = {'text': json.dumps(draft), 'model': 'authored-fixture-not-a-model-call', 'usage': {}}
     path.write_text(json.dumps(response)); original_bytes = path.read_bytes()
+    # Record the exact source and passage snapshot supplied to the original
+    # manuscript response, as production draft_with_model() always does.
+    from services.api.db import asdict
+    with Session() as session:
+        original_source = asdict(session.get(SourcePaper, source_id))
+    original_context = path.parent / 'input_evidence.json'
+    original_context.write_text(json.dumps(collect_evidence(
+        [{'id': calculation.id, 'status': 'completed',
+          'directory': str(project_dir(pid) / calculation.output_path),
+          'config': calculation.config}], [original_source])))
     config = {'run_ids': [calculation.id], 'manuscript_type': 'full_paper',
               'saved_response_run_id': origin.id, 'saved_response_path': relative}
     with Session.begin() as session:
@@ -724,11 +734,8 @@ def case_saved_response_rerenders_with_actual_evidence_without_model(client):
             saved_paper_response(session, pid, {**config, 'run_ids': []}, rerender.id)
     # When a generation saved its input context, edited numeric values or row
     # identities cannot be silently reused with the old prose.
-    evidence = collect_evidence([{'id': calculation.id, 'status': 'completed',
-                                 'directory': str(project_dir(pid) / calculation.output_path)}],
-                                [{'id': source_id, 'title': 'Python sum documentation'}])
-    old_context = path.parent.parent.parent / 'input_evidence.json'
-    old_context.write_text(json.dumps(evidence))
+    evidence = json.loads(original_context.read_text())
+    old_context = original_context
     changed = json.loads(json.dumps(evidence)); changed['runs'][0]['metrics']['integer_sum'] += 1
     with pytest.raises(ValueError, match='values or row identities changed'):
         draft_from_saved_response(path, changed, path.parent / 'rejected', origin_run_id=origin.id,
@@ -736,7 +743,54 @@ def case_saved_response_rerenders_with_actual_evidence_without_model(client):
     revision_path.write_text(json.dumps({'draft': revised, 'editor': '', 'reason': 'Missing editor identity'}))
     with pytest.raises(ValueError, match='requires draft, editor and reason'):
         draft_from_saved_response(path, evidence, path.parent / 'rejected', origin_run_id=origin.id,
-                                  origin_response_path=relative, expected_type='full_paper', revision_path=revision_path)
+                                  origin_response_path=relative, expected_type='full_paper',
+                                  original_evidence_path=old_context, revision_path=revision_path)
+
+    # The Library API retains the ID while replacing the text. The original
+    # response's source and passage citations can still resolve, but neither
+    # paper_generate nor direct replay may silently reuse its stale prose.
+    revised_source = ok(client.patch('/api/library/' + source_id, json={
+        'title': 'Python sum documentation',
+        'data': {'abstract': 'The revised document discusses a different operation',
+                 'passages': [{'text': 'Only runtime is evaluated', 'page': 7}]}}))
+    assert revised_source['id'] == source_id
+    # A Library mutation after evidence admission but before final DB publish
+    # must be refused under the same project lock as the paper writer, not
+    # merely during the earlier draft reuse check.
+    from services.api.paper_state import publish_generation, library_source_fingerprint
+    with Session() as session:
+        published = session.scalar(select(PaperDocument).where(PaperDocument.project_id == pid))
+        stale_data = dict(published.data)
+        assert stale_data['library_source_fingerprint'] != library_source_fingerprint(session, pid)
+        stale_title, stale_revision, stale_id = published.title, published.revision, published.id
+    with pytest.raises(ValueError, match='Library source evidence changed during manuscript generation'):
+        with Session.begin() as session:
+            publish_generation(session, pid, stale_title, stale_data,
+                               {'paper_id': stale_id, 'revision': stale_revision}, rerender.id)
+    with Session() as session:
+        latest_source = asdict(session.get(SourcePaper, source_id))
+    current_evidence = collect_evidence(
+        [{'id': calculation.id, 'status': 'completed',
+          'directory': str(project_dir(pid) / calculation.output_path),
+          'config': calculation.config}], [latest_source])
+    assert current_evidence['runs'][0]['metrics'] == evidence['runs'][0]['metrics']
+    assert [source['id'] for source in current_evidence['sources']] == [source_id]
+    with pytest.raises(ValueError, match='source evidence changed'):
+        draft_from_saved_response(path, current_evidence, path.parent / 'stale-blocked',
+                                  origin_run_id=origin.id, origin_response_path=relative,
+                                  expected_type='full_paper', original_evidence_path=original_context)
+    with Session.begin() as session:
+        stale_run = enqueue(session, pid, 'paper_generate', config)
+    attempted = subprocess.run([sys.executable, '-m', 'services.worker.execute',
+                                '--run-id', stale_run.id], cwd=ROOT,
+                               capture_output=True, text=True, timeout=60)
+    stale_output = project_dir(pid) / stale_run.output_path / 'result.json'
+    assert attempted.returncode != 0 or (
+        stale_output.is_file() and json.loads(stale_output.read_text())['status'] == 'failed'), (
+            attempted.stdout + attempted.stderr)
+    assert 'The builtin sums the supplied sequence' in ok(client.get('/api/papers/' + pid))['data']['source']
+    with Session() as session:
+        assert session.scalar(select(func.count()).select_from(ModelRequest)) == 0
 
 
 def case_layout_captures_edits_and_rejects_stale_publication(client):

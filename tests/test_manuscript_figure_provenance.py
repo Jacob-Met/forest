@@ -239,7 +239,7 @@ def test_worker_paper_generate_rejects_selected_unbound_figure_and_ignores_unsel
 
 def _run_worker_check():
     from services.api.common import project_dir
-    from services.api.db import PaperDocument, Session, migrate, uid
+    from services.api.db import PaperDocument, Session, asdict, migrate, uid
     from services.worker.execute import execute
     from services.worker.scheduler import enqueue
 
@@ -251,6 +251,8 @@ def _run_worker_check():
     with Session.begin() as session:
         session.add(Project(id=pid, name='Worker provenance check', goal='Reject unbound manuscript figures'))
         run = _completed_run(session, pid, root, 'r-selected', 780)
+        # The producer and consumer share the project's current scientific goal.
+        run.config = {**run.config, 'project_goal': 'Reject unbound manuscript figures'}
         session.add(SourcePaper(
             id='src-1',
             project_id=pid,
@@ -299,6 +301,17 @@ def _run_worker_check():
         'model': 'saved-fixture',
         'usage': {},
     }))
+    # A real authoring attempt always saves its exact original evidence beside
+    # the recorded model response. Replaying an unbound figure cannot bypass
+    # that source-provenance guard, even in this synthetic producer fixture.
+    with Session() as session:
+        source = asdict(session.get(SourcePaper, 'src-1'))
+        producer = session.get(TaskRun, 'r-selected')
+        source_context = collect_evidence([{
+            'id': producer.id, 'status': producer.status,
+            'directory': str(root / producer.output_path), 'config': producer.config}],
+            [source])
+    (response_file.parent / 'input_evidence.json').write_text(json.dumps(source_context))
 
     with Session.begin() as session:
         explicit = enqueue(session, pid, 'paper_generate', {

@@ -63,6 +63,12 @@ def valid_draft():
     }
 
 
+def original_evidence(tmp_path, evidence):
+    path = tmp_path / 'original-evidence.json'
+    path.write_text(json.dumps(evidence))
+    return path
+
+
 def saved_response(tmp_path, draft):
     response_path = tmp_path / 'attempt-1.json'
     response = {
@@ -140,10 +146,11 @@ def test_saved_response_without_revision_still_rejects_invalid_draft(tmp_path):
     }
     response_path, _ = saved_response(tmp_path, invalid)
 
+    evidence_path = original_evidence(tmp_path, evidence)
     with pytest.raises(ValueError, match='selects unavailable datasets'):
         draft_from_saved_response(response_path, evidence, tmp_path / 'rejected',
                                   origin_run_id='origin-1', origin_response_path='saved.json',
-                                  expected_type='full_paper')
+                                  expected_type='full_paper', original_evidence_path=evidence_path)
 
 
 def test_recorded_revision_returns_materialized_statistical_table(tmp_path):
@@ -170,9 +177,11 @@ def test_recorded_revision_returns_materialized_statistical_table(tmp_path):
     revision_path = tmp_path / 'reviewed.json'
     revision_path.write_text(json.dumps({'draft': revised, 'editor': 'Reviewer', 'reason': 'Use computed table'}))
 
+    evidence_path = original_evidence(tmp_path, evidence)
     draft, _, _ = draft_from_saved_response(
         response_path, evidence, tmp_path / 'reuse', origin_run_id='origin-1',
-        origin_response_path='saved.json', expected_type='full_paper', revision_path=revision_path)
+        origin_response_path='saved.json', expected_type='full_paper',
+        original_evidence_path=evidence_path, revision_path=revision_path)
 
     table = draft['sections'][4]['blocks'][0]
     assert table['rows'] == [['midpoint', '[[metric:statm0]]']]
@@ -199,7 +208,8 @@ def test_revision_keeps_evidence_identity_guard_and_revision_schema(tmp_path):
     with pytest.raises(ValueError, match='requires draft, editor and reason'):
         draft_from_saved_response(response_path, evidence, tmp_path / 'bad-revision',
                                   origin_run_id='origin-1', origin_response_path='saved.json',
-                                  expected_type='full_paper', revision_path=revision_path)
+                                  expected_type='full_paper', original_evidence_path=original_evidence_path,
+                                  revision_path=revision_path)
 
 
 def test_revision_still_enforces_final_manuscript_style_contract(tmp_path):
@@ -210,10 +220,12 @@ def test_revision_still_enforces_final_manuscript_style_contract(tmp_path):
     revision_path = tmp_path / 'reviewed.json'
     revision_path.write_text(json.dumps({'draft': invalid_final, 'editor': 'Reviewer', 'reason': 'Test final contract'}))
 
+    evidence_path = original_evidence(tmp_path, evidence)
     with pytest.raises(ValueError, match='AI-writing declarations'):
         draft_from_saved_response(response_path, evidence, tmp_path / 'style-rejected',
                                   origin_run_id='origin-1', origin_response_path='saved.json',
-                                  expected_type='full_paper', revision_path=revision_path)
+                                  expected_type='full_paper', original_evidence_path=evidence_path,
+                                  revision_path=revision_path)
 
 
 def test_revision_rejects_missing_required_figure(tmp_path):
@@ -224,8 +236,63 @@ def test_revision_rejects_missing_required_figure(tmp_path):
     revision_path = tmp_path / 'reviewed.json'
     revision_path.write_text(json.dumps({'draft': revision_draft, 'editor': 'Reviewer', 'reason': 'Use selected figure'}))
 
+    evidence_path = original_evidence(tmp_path, evidence)
     with pytest.raises(ValueError, match='Insert every explicitly selected figure'):
         draft_from_saved_response(
             response_path, evidence, tmp_path / 'figure-rejected', origin_run_id='origin-1',
-            origin_response_path='saved.json', expected_type='full_paper', revision_path=revision_path,
+            origin_response_path='saved.json', expected_type='full_paper',
+            original_evidence_path=evidence_path, revision_path=revision_path,
             required_figure_ids=['run-1:samples'])
+
+
+def test_saved_response_refuses_changed_cited_library_evidence_with_same_ids(tmp_path):
+    """A source ID is not evidence identity when its published passages change."""
+    evidence = actual_evidence(tmp_path)
+    source = evidence['sources'][0]
+    source['passages'] = [{'id': 'methods:p0', 'source_id': 'methods',
+                           'text': 'The protocol requires three seeded repetitions and evaluates error.',
+                           'locator': {'page': 7}, 'truncated': False,
+                           'original_characters': 67, 'trust': 'untrusted_source_evidence'}]
+    source['passage_coverage'] = {'total_passages': 1, 'included_passages': 1,
+                                  'omitted_passages': 0, 'complete': True}
+    original = tmp_path / 'original-evidence.json'
+    original.write_text(json.dumps(evidence))
+    draft = valid_draft()
+    draft['sections'][1]['paragraphs'] = [
+        'The original protocol evaluates error after three repetitions [[passage:methods:p0]].']
+    response_path, _ = saved_response(tmp_path, draft)
+
+    reused, _, baseline = draft_from_saved_response(
+        response_path, evidence, tmp_path / 'unchanged', origin_run_id='origin-1',
+        origin_response_path='saved.json', expected_type='full_paper',
+        original_evidence_path=original)
+    assert reused == draft and baseline['new_model_requests'] == 0
+
+    changed = deepcopy(evidence)
+    changed['sources'][0]['passages'][0]['text'] = (
+        'The revised protocol evaluates runtime after two repetitions.')
+    changed['sources'][0]['passages'][0]['original_characters'] = len(
+        changed['sources'][0]['passages'][0]['text'])
+    with pytest.raises(ValueError, match='source.*changed'):
+        draft_from_saved_response(response_path, changed, tmp_path / 'changed',
+                                  origin_run_id='origin-1', origin_response_path='saved.json',
+                                  expected_type='full_paper', original_evidence_path=original)
+    assert not (tmp_path / 'changed' / 'draft_reuse.json').exists()
+
+    # Changing only bibliographic metadata also changes the grounding the
+    # writer saw. A reused source reference must not silently retain it.
+    renamed = deepcopy(evidence)
+    renamed['sources'][0]['title'] = 'A revised protocol, same ID'
+    with pytest.raises(ValueError, match='source.*changed'):
+        draft_from_saved_response(response_path, renamed, tmp_path / 'renamed',
+                                  origin_run_id='origin-1', origin_response_path='saved.json',
+                                  expected_type='full_paper', original_evidence_path=original)
+
+
+def test_saved_response_requires_original_evidence_provenance(tmp_path):
+    evidence = actual_evidence(tmp_path)
+    response_path, _ = saved_response(tmp_path, valid_draft())
+    with pytest.raises(ValueError, match='original.*evidence'):
+        draft_from_saved_response(response_path, evidence, tmp_path / 'legacy',
+                                  origin_run_id='origin-1', origin_response_path='saved.json',
+                                  expected_type='full_paper')
